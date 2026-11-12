@@ -1,0 +1,15 @@
+{
+    "editor.quickSuggestions": {
+        "other": "on",
+        "comments": "off",
+        "strings": "off"
+    },
+    "editor.inlineSuggest.enabled": true,
+    "editor.suggestOnTriggerCharacters": true,
+    "terminal.integrated.suggest.quickSuggestions": {
+        "commands": "on",
+        "arguments": "on",
+        "unknown": "on"
+    },
+    "editor.quickSuggestionsDelay": 5
+}

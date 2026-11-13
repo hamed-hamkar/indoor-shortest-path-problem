@@ -54,13 +54,22 @@ def extract_wall_candidates(binary_image):
 
     core_threshold = max(1.0, float(otsu_threshold) * 0.9)
     core = np.where(distance >= core_threshold, 255, 0).astype(np.uint8)
+    core_distance = distance[core > 0]
+
+    if core_distance.size == 0:
+        return wall_mask, []
 
     # HoughLinesP braucht ein threshold, ein minLineLength und ein maxLineGap, diese sollten sich an jedes Bild anpassen
     # sollen also nicht hardcoded sein, sondern adaptiv sein und sich an andere Bilder anpassen
     # 1. Idee: Bildskalierung nutzen -> schlecht, weil die Werte immernoch gehardcoded sind: scale * 0.025 = 2,5% * scale
     # 2. Idee: den median oder average von den Distanzen ausrechnen -> besser, aber es bleiben Pixelreste von den Möbeln
 
-    lines = cv2.HoughLinesP(core, rho=1, theta=np.pi / 180, threshold= core_threshold, minLineLength=)
+    wall_thickness = 2 * float(np.median(core_distance))
+    min_line_length = max(1, int(round(wall_thickness)))
+    max_line_gap = max(1, int(round(wall_thickness * 0.25)))
+    hough_threshold = max(1, int(round(min_line_length * 0.5)))
+
+    lines = cv2.HoughLinesP(core, rho=1, theta=np.pi / 180, threshold=hough_threshold, minLineLength=min_line_length, maxLineGap=max_line_gap)
 
     
 

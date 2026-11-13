@@ -71,8 +71,68 @@ def extract_wall_candidates(binary_image):
 
     lines = cv2.HoughLinesP(core, rho=1, theta=np.pi / 180, threshold=hough_threshold, minLineLength=min_line_length, maxLineGap=max_line_gap)
 
-    
+    if lines is None:
+        return wall_mask, []
 
+    # HoughLinesP ist nicht perfekt, es kreiert für einzelne Wand-Linien mehrere Linien
+    # diese Werden gefiltert, erstmal in horizontale und vertikale Linien
+    # um später Rechtecke basierend auf diesen Linien zu bilden
+
+    raw_segments = []
+    # HoughLinesP speichert Daten in einer 1 Dimensionalen List,
+    # es gibt 4 Werte, jeweils 2 Paare die Eckpunkte bilden, (x1, y1) und (x2, y2)
+
+    for x1, y1, x2, y2 in lines:
+        dx, dy = int(x2 - x1), int(y2 - y1)
+
+        # dabei kann x1 > x2 sein, also sollte man das erst sortieren
+        horizontal = abs(dx) >= abs(dy)
+
+        # Daten so speicher, dass man aus denen ein Rechteck bilden kann
+        if horizontal:
+            coord, start, end = (y1 + y2) / 2, min(x1, x2), max(x1, x2)
+
+        else:
+            coord, start, end = (x1 + x2) / 2, min(y1, y2), max(y1, y2)
+        
+        raw_segments.append((horizontal, coord, int(start), int(end)))
+
+    # Gruppiere doppelte Ereknnungen anhand ihrer Ausrichtung, Behalte Gruppen-ID, damit
+    # Öffnungserkennung später nur Linienabschnitte vergleichen kann, die zur gleichen Achse gehören
+    # Hough kann Wandverbindungen von benachbarten Mittellinien die selbe Wand_linie erkennen
+    # Gruppiere diese Linien innerhalb eines etwas größeren Abstand als zuvor
+    # Getrennte parallele Wände sollen weiterhin voneinander getrennt bleiben
+    # In kurz, gruppiere die von Hough erkannten Liniensegments in Abschnitte, damit doppelte
+    # oder leicht versetzte Treffer später nicht als viele verschiedene Wände behandelt werden
+
+    # Toleranz fur die Position, also der maximale Abstand bei denen wwei parallele Segmente
+    # noch als selbe Wandspur gelten
+    pos_tol = core_threshold * 2.0
+
+    # sortiere Lines in horizontale und vertikale(nicht horizontale) Linien
+    ordered_segments = []
+
+    for horizontal in (True, False):
+        ordered = sorted((s for s in raw_segments if s[0] == horizontal), key=lambda s: s[1])
+        ordered_segments.append((horizontal, ordered))
+    # speichere Segmente basierend auf Position der y-Achse in eine Liste
+    # dabei soll y-Achse sich anpassen
+    grouped = []
+    group_id = 0
+        
+    for horizontal, ordered in ordered_segments:
+        # Wenn bands leer ist oder Segmente nicht nah genug sind,
+        # kreiere neues Segment mit der Position
+        bands = []
+
+        for segment in ordered:
+            if not bands or segment[1] - bands[-1][0] > pos_tol:
+                bands.append([segment[1], [segment]])
+            # falls Position nah genaug ist, verbinde es mit existierendem Segmenten und berechne
+            # die Position neu
+            else:
+                bands[-1][1].append(segment)
+                bands[-1][0] = float()
 
 
     return

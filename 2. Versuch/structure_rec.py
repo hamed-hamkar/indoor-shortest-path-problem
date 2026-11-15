@@ -4,11 +4,12 @@ import numpy as np
 
 def analyze_structures(binary_image):
     """Extract wall rectangles, find openings, then classify their evidence."""
-    wall_mask, wall_rectangles = extract_wall_candidates(binary_image)
+    wall_mask, wall_rectangles, otsu_image = extract_wall_candidates(binary_image)
 
     return {
         "wall_mask": wall_mask,
         "wall_rectangles": wall_rectangles,
+        "otsu_image": otsu_image
     }
 
 
@@ -37,7 +38,7 @@ def extract_wall_candidates(binary_image):
 
     foreground_distances_u8 = np.clip(foreground_distances, 0, 255).reshape(-1, 1).astype(np.uint8)
 
-    otsu_threshold, _ = cv2.threshold(
+    otsu_threshold, otsu_image = cv2.threshold(
         foreground_distances_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
@@ -165,7 +166,7 @@ def extract_wall_candidates(binary_image):
         for horizontal, band_id, coord, start, end in grouped:
             # breite der Rechtecke berechnen
             if horizontal:
-                coords = np.aragne(start, end + 1, dtype=int)
+                coords = np.arange(start, end + 1, dtype=int)
                 xs = np.clip(coords, 0, width - 1)
                 ys = np.full(xs.shape, np.clip(coord, 0, height -1), dtype = int)
             else:
@@ -186,16 +187,18 @@ def extract_wall_candidates(binary_image):
                 corners = [
                     (int(start), int(coord - half_thickness)),
                     (int(end), int( coord - half_thickness)),
+                    (int(end), int(coord + half_thickness)),
                     (int(start), int(coord + half_thickness)),
-                    (int(end), int(coord + half_thickness))
                 ]
             else:
                 corners = [
-                    int(coord - half_thickness), int(start),
-                    int(coord - half_thickness), int(end),
-                    int(coord + half_thickness), int(start),
-                    int(coord + half_thickness), int(end)
+                    (int(coord - half_thickness), int(start)),
+                    (int(coord + half_thickness), int(start)),
+                    (int(coord + half_thickness), int(end)),
+                    (int(coord - half_thickness), int(end)),
                 ]
+
+            cv2.fillConvexPoly(wall_mask, np.asarray(corners, dtype=np.int32), 255)
             wall_rectangle.append(corners)
                 
-    return wall_mask, wall_rectangle
+    return wall_mask, wall_rectangle, otsu_image

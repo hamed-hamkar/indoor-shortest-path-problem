@@ -5,18 +5,10 @@ import numpy as np
 def analyze_structures(binary_image):
     """Extract wall rectangles, find openings, then classify their evidence."""
     wall_mask, wall_rectangles = extract_wall_candidates(binary_image)
-    openings = recognize_opening_in_wall(wall_rectangles)
-    windows, doors, unknown_openings = recognize_window_and_door(binary_image, openings)
-    furniture = recognize_furniture(binary_image, wall_mask, windows, doors, openings)
 
     return {
         "wall_mask": wall_mask,
         "wall_rectangles": wall_rectangles,
-        "openings": openings,
-        "windows": windows,
-        "doors": doors,
-        "unknown_openings": unknown_openings,
-        "furniture": furniture,
     }
 
 
@@ -115,24 +107,95 @@ def extract_wall_candidates(binary_image):
     for horizontal in (True, False):
         ordered = sorted((s for s in raw_segments if s[0] == horizontal), key=lambda s: s[1])
         ordered_segments.append((horizontal, ordered))
-    # speichere Segmente basierend auf Position der y-Achse in eine Liste
-    # dabei soll y-Achse sich anpassen
-    grouped = []
-    group_id = 0
+        # speichere Segmente basierend auf Position der y-Achse in eine Liste
+        # dabei soll y-Achse sich anpassen
+        grouped = []
+        group_id = 0
         
-    for horizontal, ordered in ordered_segments:
-        # Wenn bands leer ist oder Segmente nicht nah genug sind,
-        # kreiere neues Segment mit der Position
-        bands = []
+        for horizontal, ordered in ordered_segments:
+            # Wenn bands leer ist oder Segmente nicht nah genug sind,
+            # kreiere neues Segment mit der Position
+            bands = []
 
-        for segment in ordered:
-            if not bands or segment[1] - bands[-1][0] > pos_tol:
-                bands.append([segment[1], [segment]])
-            # falls Position nah genaug ist, verbinde es mit existierendem Segmenten und berechne
-            # die Position neu
+
+            for segment in ordered:
+                # wenn bands leer ist oder der positions Wert zu weit entfernt ist, kreiere neues bands-segment
+                if not bands or segment[1] - bands[-1][0] > pos_tol:
+                    bands.append([segment[1], [segment]])
+                
+                # falls Position nah genaug ist, verbinde es mit existierendem Segmenten und berechne
+                # die Position neu, da ordered soritert ist, muss es nicht durch alle Elemente gehen,
+                # sondern nur das letzte Element in bands ansprechen, positions Wert muss sich deswegen anpassen,
+                # weil sonst spätere Linien nicht mehr angesprochen werden, die eigentlich dazu passen, nutze median
+                else:
+                    bands[-1][1].append(segment)
+                    # berechne median, damit es sich anpasst
+                    bands[-1][0] = float(np.median([item[1] for item in bands[-1][1]]))
+
+            for coord, band in bands:
+                intervals = []
+                # start und end Punkte müssen sortiert werden, da Beispielsweise für bands:
+                # (True, 25, 19, 20)
+                # (True, 25, 18, 30)
+                # (True, 25, 10, 15)
+                # kann es zu Probleme mit diesen Werten kommen, deswegen erst sortieren
+
+                for start, end in sorted([(s[2], s[3]) for s in band]):
+                    # Verbinde überlappende oder nahe Linien
+                    # Echte gaps müssen trotzdem bleiben
+
+                    # start <= intervals[-1][1] + toleranz, also start <= vorheriuges Ende + toleranz --> keine Lücke
+                    if intervals and start <= intervals[-1][1] + pos_tol:
+                        intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
+                    # start > intervals[-1][1] + toleranz, also start > vorheriuges Ende + toleranz --> eine Lücke, neuer Eintrag
+                    else: 
+                        intervals.append((start, end))
+                grouped.extend((horizontal, group_id, int(round(coord)), a, b) for a, b in intervals)
+                group_id += 1
+
+        # grouped kann so aussehen:
+        # (True,  0,  25, 10, 30),
+        # (True,  0,  25, 40, 50),
+        # (True,  1, 100,  5, 45),
+        # (False, 2,  70, 12, 60),
+        # (False, 2,  70, 75, 90)
+        # selbe group_id, bedeutet, die gleichen y-Wert/x-Wert, fals horizontal/vertikal
+        # kann man aber ignorieren, muss einfach nur darüber iterieren und Rechtecke bilden, dicke muss ausgerechnet werden
+        wall_rectangle = []
+        for horizontal, band_id, coord, start, end in grouped:
+            # breite der Rechtecke berechnen
+            if horizontal:
+                coords = np.aragne(start, end + 1, dtype=int)
+                xs = np.clip(coords, 0, width - 1)
+                ys = np.full(xs.shape, np.clip(coord, 0, height -1), dtype = int)
             else:
-                bands[-1][1].append(segment)
-                bands[-1][0] = float()
+                coords = np.arange(start, end + 1, dtype=int)
+                ys = np.clip(coords, 0, height - 1)
+                xs = np.full(ys.shape, np.clip(coord, 0, width - 1), dtype=int)
 
+            rec_distance = distance[ys, xs]
+            rec_distance = rec_distance[rec_distance > 0]
+            if rec_distance.size == 0:
+                continue
+            half_thickness = max(1, int(round(float(np.mean(rec_distance)) + core_threshold)))
 
-    return
+            if end - start + 1 < 2 * half_thickness:
+                continue
+
+            if horizontal:
+                corners = [
+                    (int(start), int(coord - half_thickness)),
+                    (int(end), int( coord - half_thickness)),
+                    (int(start), int(coord + half_thickness)),
+                    (int(end), int(coord + half_thickness))
+                ]
+            else:
+                corners = [
+                    int(coord - half_thickness), int(start),
+                    int(coord - half_thickness), int(end),
+                    int(coord + half_thickness), int(start),
+                    int(coord + half_thickness), int(end)
+                ]
+            wall_rectangle.append(corners)
+                
+    return wall_mask, wall_rectangle

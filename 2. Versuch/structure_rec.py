@@ -4,12 +4,20 @@ import numpy as np
 
 def analyze_structures(binary_image):
     """Extract wall rectangles, find openings, then classify their evidence."""
-    wall_mask, wall_rectangles, otsu_image = extract_wall_candidates(binary_image)
+    (
+        wall_rectangles,
+        otsu_image,
+        core_image,
+        horizontal_hough_overlay,
+        vertical_hough_overlay,
+    ) = extract_wall_candidates(binary_image)
 
     return {
-        "wall_mask": wall_mask,
         "wall_rectangles": wall_rectangles,
-        "otsu_image": otsu_image
+        "otsu_image": otsu_image,
+        "core_image": core_image,
+        "horizontal_hough_overlay": horizontal_hough_overlay,
+        "vertical_hough_overlay": vertical_hough_overlay,
     }
 
 
@@ -23,11 +31,14 @@ def extract_wall_candidates(binary_image):
     # Speichert die Distanz von den weißen Pixeln (Wert von 255) zum nächsten schwarzen Pixel (Wert von 0)
     distance = cv2.distanceTransform(binary_image, cv2.DIST_L2, 5)
     foreground_distances = distance[binary_image > 0]
-    wall_mask = np.zeros_like(binary_image)
+    otsu_image = np.zeros_like(binary_image)
+    core = np.zeros_like(binary_image)
+    horizontal_hough_overlay = cv2.cvtColor(core, cv2.COLOR_GRAY2BGR)
+    vertical_hough_overlay = cv2.cvtColor(core, cv2.COLOR_GRAY2BGR)
 
     # Wenn forgorund_distance keine Werte hat, gibt es keine Wände
     if foreground_distances.size == 0:
-        return wall_mask, []
+        return [], otsu_image, core, horizontal_hough_overlay, vertical_hough_overlay
 
     # Otsu ist ein Verfahren zur automatischen Bestimmung eines Schwellenwertes,
     # eignet sich, wenn es wenn man Daten in 2 Kategorien unterteilen will
@@ -42,15 +53,21 @@ def extract_wall_candidates(binary_image):
         foreground_distances_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
+    # test
+    spatial_otsu_image = np.zeros_like(binary_image)
+    spatial_otsu_image[binary_image > 0] = otsu_image.ravel()
+
     # Otsu kann dünnere Wände abschneiden, damit das nicht passiert, verkleinern wir den otsu_threshold
     # und sorgen dafür, dass es nicht kleiner als 1 Pixel werden kann
 
     core_threshold = max(1.0, float(otsu_threshold) * 0.9)
     core = np.where(distance >= core_threshold, 255, 0).astype(np.uint8)
+    horizontal_hough_overlay = cv2.cvtColor(core, cv2.COLOR_GRAY2BGR)
+    vertical_hough_overlay = cv2.cvtColor(core, cv2.COLOR_GRAY2BGR)
     core_distance = distance[core > 0]
 
     if core_distance.size == 0:
-        return wall_mask, []
+        return [], spatial_otsu_image, core, horizontal_hough_overlay, vertical_hough_overlay
 
     # HoughLinesP braucht ein threshold, ein minLineLength und ein maxLineGap, diese sollten sich an jedes Bild anpassen
     # sollen also nicht hardcoded sein, sondern adaptiv sein und sich an andere Bilder anpassen
@@ -60,12 +77,24 @@ def extract_wall_candidates(binary_image):
     wall_thickness = 2 * float(np.median(core_distance))
     min_line_length = max(1, int(round(wall_thickness)))
     max_line_gap = max(1, int(round(wall_thickness * 0.25)))
-    hough_threshold = max(1, int(round(min_line_length * 0.5)))
+    hough_threshold = max(1, int(round(min_line_length * 0.4)))
+
+    # !!!
+    # !!!
+    # !!!
+    # !!!
+    # HoughLinesP funktioniert nicht gut mit der erkennnung von den kleinen Wänden,
+    # nutze Edges, cv2.Canny(), cv2.findContours, cv2.approxPolyDP oder ed = cv2.ximgprox.createEdgeDrawing()
+    # und dann ed.detectEdges() und dann ed.getSegments() und dann basierend auf den Linien-Punkten Rechtecke bilden
+    # !!!
+    # !!!
+    # !!!
+    # !!!
 
     lines = cv2.HoughLinesP(core, rho=1, theta=np.pi / 180, threshold=hough_threshold, minLineLength=min_line_length, maxLineGap=max_line_gap)
 
     if lines is None:
-        return wall_mask, []
+        return [], spatial_otsu_image, core, horizontal_hough_overlay, vertical_hough_overlay
 
     # HoughLinesP ist nicht perfekt, es kreiert für einzelne Wand-Linien mehrere Linien
     # diese Werden gefiltert, erstmal in horizontale und vertikale Linien
@@ -75,11 +104,18 @@ def extract_wall_candidates(binary_image):
     # HoughLinesP speichert Daten in einer 1 Dimensionalen List,
     # es gibt 4 Werte, jeweils 2 Paare die Eckpunkte bilden, (x1, y1) und (x2, y2)
 
-    for x1, y1, x2, y2 in lines:
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
         dx, dy = int(x2 - x1), int(y2 - y1)
 
-        # dabei kann x1 > x2 sein, also sollte man das erst sortieren
         horizontal = abs(dx) >= abs(dy)
+        line_overlay = horizontal_hough_overlay if horizontal else vertical_hough_overlay
+        cv2.line(
+            line_overlay,
+            (int(x1), int(y1)),
+            (int(x2), int(y2)),
+            (0, 0, 255),
+            1,
+        )
 
         # Daten so speicher, dass man aus denen ein Rechteck bilden kann
         if horizontal:
@@ -180,7 +216,7 @@ def extract_wall_candidates(binary_image):
                 continue
             half_thickness = max(1, int(round(float(np.mean(rec_distance)) + core_threshold)))
 
-            if end - start + 1 < 2 * half_thickness:
+            if end - start < 2 * half_thickness:
                 continue
 
             if horizontal:
@@ -198,7 +234,12 @@ def extract_wall_candidates(binary_image):
                     (int(coord - half_thickness), int(end)),
                 ]
 
-            cv2.fillConvexPoly(wall_mask, np.asarray(corners, dtype=np.int32), 255)
             wall_rectangle.append(corners)
                 
-    return wall_mask, wall_rectangle, otsu_image
+    return (
+        wall_rectangle,
+        spatial_otsu_image,
+        core,
+        horizontal_hough_overlay,
+        vertical_hough_overlay,
+    )

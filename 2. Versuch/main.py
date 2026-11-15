@@ -13,25 +13,18 @@ images = preprocess_image(str(image_path))
 structures = analyze_structures(images["binary"])
 
 
-# Die Rechtecke sowohl auf dem Originalbild als auch auf der Wandmaske anzeigen.
+# Die Rechtecke auf dem Originalbild anzeigen.
 rectangles_on_original = images["original"].copy()
-rectangles_on_mask = cv2.cvtColor(
-    structures["wall_mask"].copy(),
-    cv2.COLOR_GRAY2BGR,
-)
 
 for rectangle_corners in structures["wall_rectangles"]:
     corners = np.asarray(rectangle_corners, dtype=np.int32)
     cv2.polylines(rectangles_on_original, [corners], True, (0, 0, 255), 2)
-    cv2.polylines(rectangles_on_mask, [corners], True, (0, 0, 255), 2)
 
-
-cv2.imshow("Original", images["original"])
-cv2.imshow("Binary", images["binary"])
-cv2.imshow("Wall mask", structures["wall_mask"])
 cv2.imshow("Rectangles on original", rectangles_on_original)
-cv2.imshow("Rectangles on wall mask", rectangles_on_mask)
 cv2.imshow("otsu_image", structures["otsu_image"])
+cv2.imshow("Core (input to HoughLinesP)", structures["core_image"])
+cv2.imshow("Hough horizontal (red over core)", structures["horizontal_hough_overlay"])
+cv2.imshow("Hough vertical (red over core)", structures["vertical_hough_overlay"])
 
 cv2.waitKey(0)
 cv2.destroyAllWindows()

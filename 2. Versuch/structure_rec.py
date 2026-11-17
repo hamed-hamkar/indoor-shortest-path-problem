@@ -112,7 +112,7 @@ def extract_wall_candidates(binary_image):
         rectangles.append((horizontal, corners))
 
     rectangles = filter_wall_rectangles(rectangles, otsu_image)
-    rectangles = expand_rectangles(
+    rectangles = expand_rectangles_and_add_gap_checkers(
         rectangles, margin=2, image_shape=binary_image.shape
     )
 
@@ -126,84 +126,53 @@ def extract_wall_candidates(binary_image):
     }
 
 
-def recognize_opening_in_wall(wall_rectangles, threshold):
-    # Find gaps between consecutive wall rectangles in the same aligned band.
-    gaps = []
+def recognize_opening_in_wall(wall_rectangles, threshold=0):
+    bands = {}
+    for rectangle in wall_rectangles:
+        bands.setdefault(rectangle["group_id"], []).append(rectangle)
 
-    horizontal_walls = []
-    vertical_walls = []
+    openings = []
+    for rectangles in bands.values():
+        rectangles.sort(key=lambda item: item["start"])
+        for first, second in zip(rectangles, rectangles[1:]):
+            local_wall_thickness = (
+                first["half_thickness"] + second["half_thickness"]
+            )
+            if min(
+                first["end"] - first["start"] + 1,
+                second["end"] - second["start"] + 1,
+            ) < local_wall_thickness:
+                continue
 
-    for horizontal, corners in wall_rectangles:
-        if horizontal:
-            horizontal_walls.append(corners)
-        else:
-            vertical_walls.append(corners)
+            gap_start = first["end"] + 1
+            gap_end = second["start"] - 1
+            if gap_start > gap_end:
+                continue
 
-    # Wände mit (x1, y1), (x2, y2), (x3, y3) und (x4, y4):
-    # (x1, y1), (x2, y2)
-    # (x4, y4), (x3, y3)
-    # da es symmetrisch ist, sind alle parallelen Seiten gleich lang:
-    # (x1, y1), (x2, y1)
-    # (x1, y2), (x2, y2)
-    # also: (x1, y1), (x2, y1), (x1, y2), (x2, y2)
+            half_thickness = int(round(local_wall_thickness / 2)) + threshold
+            centerline = int(
+                round((first["centerline"] + second["centerline"]) / 2)
+            )
+            if first["horizontal"]:
+                corners = (
+                    (gap_start, centerline - 2 * half_thickness),
+                    (gap_end, centerline - 2 * half_thickness),
+                    (gap_end, centerline + 2 * half_thickness),
+                    (gap_start, centerline + 2 * half_thickness),
+                )
+            else:
+                corners = (
+                    (centerline - 2 * half_thickness, gap_start),
+                    (centerline + 2 * half_thickness, gap_start),
+                    (centerline + 2 * half_thickness, gap_end),
+                    (centerline - 2 * half_thickness, gap_end),
+                )
 
-    if len(horizontal_walls) == 0 and len(vertical_walls) == 0:
-        print("Keine Wände")
+            openings.append(
+                tuple((int(x), int(y)) for x, y in corners)
+            )
 
-    for i in range(1, len(horizontal_walls)):
-        (x1, y1), (x2, y1), (x1, y2), (x2, y2) = horizontal_walls[i]
-
-        for j in range(i + 1, len(horizontal_walls)):
-            (x3, y3), (x4, y3), (x3, y4), (x4, y4) = horizontal_walls[j]
-            # check ob die y-Werte ungefähr so sind, dass die auf der selben Höhe sind
-            # y3 ist kleiner als y4
-            if y1 < y4 and y2 > y3:
-                # Check ob die Wände nicht ineinander sind
-                if x1 > x4:
-                    y_wert_1 = int(min(y1, y3) - threshold)
-                    y_wert_2 = int(max(y2, y4) + threshold)
-                    gap_corners = ((x4, y_wert_1), (x1, y_wert_1), (x4, y_wert_2), (x1, y_wert_2))
-
-                elif x2 < x3:
-                    y_wert_1 = int(min(y1, y3) - threshold)
-                    y_wert_2 = int(max(y2, y4) + threshold)
-                    gap_corners = ((x2, y_wert_1), (x3, y_wert_1), (x2, y_wert_2), (x3, y_wert_2))
-
-                gaps.append(gap_corners)
-
-    for i in range(1, len(vertical_walls)):
-        (x1, y1), (x2, y1), (x1, y2), (x2, y2) = vertical_walls[i]
-
-        for j in range(i + 1, len(vertical_walls)):
-            (x3, y3), (x4, y3), (x3, y4), (x4, y4) = vertical_walls[j]
-            # check ob die x-Werte ungefähr so sind, dass die auf der selben Höhe sind
-            # x3 ist kleiner als x4
-            if x1 < x4 and x2 > x3:
-                # Check ob die Wände nicht ineinander sind
-                if y1 > y4:
-                    x_wert_1 = int(min(x1, x3) - threshold)
-                    x_wert_2 = int(max(x2, x4) + threshold)
-                    gap_corners = ((x_wert_1, y4), (x_wert_2, y4), (x_wert_1, y1), (x_wert_2, y1))
-
-                elif y2 < y3:
-                    x_wert_1 = int(min(x1, x3) - threshold)
-                    x_wert_2 = int(max(x2, x4) + threshold)
-                    gap_corners = ((x_wert_1, y2), (x_wert_2, y2), (x_wert_1, y3), (x_wert_2, y3))
-
-                gaps.append(gap_corners)
-
-    #
-    #
-    #
-    #
-    # doppelt und dreifache Gaps werden erkannt, weil es keine max größe für die Lücken hat
-    # füge max Lückenlänge und eine Wand kann nur jeweils ein Fenster an einem Ende haben und nicht mehrere
-    #
-    #
-    #
-    #
-
-    return gaps
+    return openings
 
 def segments_helper(segments, epsilon=2):
     simplified_segments = []
@@ -265,9 +234,12 @@ def find_parallel_pairs(simplified_segments, wall_thickness):
 def filter_wall_rectangles(rectangles, wall_image, min_support=0.5):
     accepted = []
 
-    for corners in rectangles:
+    for horizontal, corners in rectangles:
         rectangel_mask = np.zeros_like(wall_image)
-        polygon = np.asarray(corners)
+        polygon = np.asarray(
+            (corners[0], corners[1], corners[3], corners[2]),
+            dtype=np.int32,
+        )
         cv2.fillConvexPoly(rectangel_mask, polygon, 255)
 
         inside = rectangel_mask > 0
@@ -278,15 +250,15 @@ def filter_wall_rectangles(rectangles, wall_image, min_support=0.5):
         support = np.count_nonzero(wall_image[inside] > 0) / area
 
         if support >= min_support:
-            accepted.append(corners)
+            accepted.append((horizontal, corners))
 
     return accepted
 
-def expand_rectangles(rectangles, margin, image_shape):
+def expand_rectangles_and_add_gap_checkers(rectangles, margin, image_shape):
     height, width = image_shape
     expanded = []
 
-    for corners in rectangles:
+    for horizontal, corners in rectangles:
         xs = [point[0] for point in corners]
         ys = [point[1] for point in corners]
         left = max(0, min(xs) - margin)
@@ -294,13 +266,58 @@ def expand_rectangles(rectangles, margin, image_shape):
         top = max(0, min(ys) - margin)
         bottom = min(height - 1, max(ys) + margin)
 
-        expanded.append(
-            (
+        expanded.append({
+            "horizontal": horizontal,
+            "start": left if horizontal else top,
+            "end": right if horizontal else bottom,
+            "centerline": (top + bottom) / 2 if horizontal else (left + right) / 2,
+            "half_thickness": (
+                (bottom - top) / 2 if horizontal else (right - left) / 2
+            ),
+            "corners": (
                 (left, top),
                 (right, top),
                 (right, bottom),
                 (left, bottom),
-            )
+            ),
+        })
+
+    if not expanded:
+        return expanded
+
+    band_tolerance = max(
+        2.0,
+        float(np.median([rectangle["half_thickness"] for rectangle in expanded]))
+        * 0.5,
+    )
+    group_id = 0
+    for horizontal in (True, False):
+        aligned_rectangles = sorted(
+            (
+                rectangle
+                for rectangle in expanded
+                if rectangle["horizontal"] == horizontal
+            ),
+            key=lambda rectangle: rectangle["centerline"],
         )
+        bands = []
+        for rectangle in aligned_rectangles:
+            if (
+                not bands
+                or rectangle["centerline"] - bands[-1][0] > band_tolerance
+            ):
+                bands.append([rectangle["centerline"], [rectangle]])
+            else:
+                bands[-1][1].append(rectangle)
+                bands[-1][0] = float(
+                    np.median(
+                        [item["centerline"] for item in bands[-1][1]]
+                    )
+                )
+
+        for _, band_rectangles in bands:
+            for rectangle in band_rectangles:
+                rectangle["group_id"] = group_id
+            group_id += 1
 
     return expanded

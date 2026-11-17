@@ -12,19 +12,19 @@ image_path = project_dir / "Bilder" / "Floor_Test_1.png"
 images = preprocess_image(str(image_path))
 structures = analyze_structures(images["binary"])
 
+original = images["original"]
+rectangles_overlay = original.copy()
 
-# Die Rechtecke auf dem Originalbild anzeigen.
-rectangles_on_original = images["original"].copy()
+for rectangle in structures["wall_rectangles"]:
+    corners = np.asarray(rectangle, dtype=np.int32).reshape(-1, 1, 2)
+    cv2.polylines(rectangles_overlay, [corners], True, (0, 255, 255), 2)
 
-for rectangle_corners in structures["wall_rectangles"]:
-    corners = np.asarray(rectangle_corners, dtype=np.int32)
-    cv2.polylines(rectangles_on_original, [corners], True, (0, 0, 255), 2)
 
-cv2.imshow("Rectangles on original", rectangles_on_original)
 cv2.imshow("otsu_image", structures["otsu_image"])
-cv2.imshow("Core (input to HoughLinesP)", structures["core_image"])
-cv2.imshow("Hough horizontal (red over core)", structures["horizontal_hough_overlay"])
-cv2.imshow("Hough vertical (red over core)", structures["vertical_hough_overlay"])
+cv2.imshow("Core input", structures["core_image"])
+cv2.imshow("EdgeDrawing edges", structures["edge_image"])
+cv2.imshow("Filtered wall rectangles", rectangles_overlay)
+
 
 cv2.waitKey(0)
 cv2.destroyAllWindows()

@@ -3,42 +3,31 @@ import numpy as np
 
 
 def analyze_structures(binary_image):
-    """Extract wall rectangles, find openings, then classify their evidence."""
-    (
-        wall_rectangles,
-        otsu_image,
-        core_image,
-        horizontal_hough_overlay,
-        vertical_hough_overlay,
-    ) = extract_wall_candidates(binary_image)
 
-    return {
-        "wall_rectangles": wall_rectangles,
-        "otsu_image": otsu_image,
-        "core_image": core_image,
-        "horizontal_hough_overlay": horizontal_hough_overlay,
-        "vertical_hough_overlay": vertical_hough_overlay,
-    }
+    return extract_wall_candidates(binary_image)
 
 
 def extract_wall_candidates(binary_image):
-    # Kontrolliert, ob binary_image ein valide Eingabe ist
-    if binary_image is None or binary_image.ndim != 2 :
-        raise ValueError("binary_image in extract_wall_candidates ist kein zweidimensionales Binärbild")
+    if binary_image is None or binary_image.ndim != 2:
+        raise ValueError(
+            "binary_image in extract_wall_candidates ist kein zweidimensionales Binärbild"
+        )
 
-    height, width = binary_image.shape
-
-    # Speichert die Distanz von den weißen Pixeln (Wert von 255) zum nächsten schwarzen Pixel (Wert von 0)
     distance = cv2.distanceTransform(binary_image, cv2.DIST_L2, 5)
     foreground_distances = distance[binary_image > 0]
     otsu_image = np.zeros_like(binary_image)
     core = np.zeros_like(binary_image)
-    horizontal_hough_overlay = cv2.cvtColor(core, cv2.COLOR_GRAY2BGR)
-    vertical_hough_overlay = cv2.cvtColor(core, cv2.COLOR_GRAY2BGR)
 
     # Wenn forgorund_distance keine Werte hat, gibt es keine Wände
     if foreground_distances.size == 0:
-        return [], otsu_image, core, horizontal_hough_overlay, vertical_hough_overlay
+        return {
+            "wall_rectangles": [],
+            "otsu_image": otsu_image,
+            "core_image": core,
+            "edge_image": core.copy(),
+            "segments": [],
+            "simplified_segments": [],
+        }
 
     # Otsu ist ein Verfahren zur automatischen Bestimmung eines Schwellenwertes,
     # eignet sich, wenn es wenn man Daten in 2 Kategorien unterteilen will
@@ -47,199 +36,271 @@ def extract_wall_candidates(binary_image):
     # foreground_distance speichert Pixel in Int 32-Bit in einem 1 Dimensionalen Array
     # reshape(-1, 1): -1 = beliebig viele Zeilen, wie benötigt werden; 1 = es soll nur 1 Spalte geben 
 
-    foreground_distances_u8 = np.clip(foreground_distances, 0, 255).reshape(-1, 1).astype(np.uint8)
-
-    otsu_threshold, otsu_image = cv2.threshold(
-        foreground_distances_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    foreground_distances_u8 = (
+        np.clip(foreground_distances, 0, 255)
+        .reshape(-1, 1)
+        .astype(np.uint8)
     )
 
-    # test
-    spatial_otsu_image = np.zeros_like(binary_image)
-    spatial_otsu_image[binary_image > 0] = otsu_image.ravel()
+    otsu_threshold, otsu_values = cv2.threshold(
+        foreground_distances_u8,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    otsu_image[binary_image > 0] = otsu_values.ravel()
 
     # Otsu kann dünnere Wände abschneiden, damit das nicht passiert, verkleinern wir den otsu_threshold
     # und sorgen dafür, dass es nicht kleiner als 1 Pixel werden kann
-
     core_threshold = max(1.0, float(otsu_threshold) * 0.9)
     core = np.where(distance >= core_threshold, 255, 0).astype(np.uint8)
-    horizontal_hough_overlay = cv2.cvtColor(core, cv2.COLOR_GRAY2BGR)
-    vertical_hough_overlay = cv2.cvtColor(core, cv2.COLOR_GRAY2BGR)
     core_distance = distance[core > 0]
 
-    if core_distance.size == 0:
-        return [], spatial_otsu_image, core, horizontal_hough_overlay, vertical_hough_overlay
-
-    # HoughLinesP braucht ein threshold, ein minLineLength und ein maxLineGap, diese sollten sich an jedes Bild anpassen
-    # sollen also nicht hardcoded sein, sondern adaptiv sein und sich an andere Bilder anpassen
-    # 1. Idee: Bildskalierung nutzen -> schlecht, weil die Werte immernoch gehardcoded sind: scale * 0.025 = 2,5% * scale
-    # 2. Idee: den median oder average von den Distanzen ausrechnen -> besser, aber es bleiben Pixelreste von den Möbeln
-
-    wall_thickness = 2 * float(np.median(core_distance))
-    min_line_length = max(1, int(round(wall_thickness)))
-    max_line_gap = max(1, int(round(wall_thickness * 0.25)))
-    hough_threshold = max(1, int(round(min_line_length * 0.4)))
-
-    # !!!
-    # !!!
-    # !!!
-    # !!!
     # HoughLinesP funktioniert nicht gut mit der erkennnung von den kleinen Wänden,
     # nutze Edges, cv2.Canny(), cv2.findContours, cv2.approxPolyDP oder ed = cv2.ximgprox.createEdgeDrawing()
     # und dann ed.detectEdges() und dann ed.getSegments() und dann basierend auf den Linien-Punkten Rechtecke bilden
-    # !!!
-    # !!!
-    # !!!
-    # !!!
 
-    lines = cv2.HoughLinesP(core, rho=1, theta=np.pi / 180, threshold=hough_threshold, minLineLength=min_line_length, maxLineGap=max_line_gap)
+    edge_image = np.zeros_like(core)
+    segments = []
+    if np.any(core):
+        outlines = cv2.ximgproc.createEdgeDrawing()
+        outlines.detectEdges(core)
+        edge_image = outlines.getEdgeImage()
+        segments = outlines.getSegments() or []
 
-    if lines is None:
-        return [], spatial_otsu_image, core, horizontal_hough_overlay, vertical_hough_overlay
+    simplified_segments = segments_helper(segments)
 
-    # HoughLinesP ist nicht perfekt, es kreiert für einzelne Wand-Linien mehrere Linien
-    # diese Werden gefiltert, erstmal in horizontale und vertikale Linien
-    # um später Rechtecke basierend auf diesen Linien zu bilden
+    # Rechteckbildung:
+    # [(50, 40), (50, 100)],            # gerader Abschnitt
+    # [(20, 30), (80, 30), (80, 90)]    # Abschnitt mit einer Ecke
 
-    raw_segments = []
-    # HoughLinesP speichert Daten in einer 1 Dimensionalen List,
-    # es gibt 4 Werte, jeweils 2 Paare die Eckpunkte bilden, (x1, y1) und (x2, y2)
+    wall_thickness = 3 * float(np.median(core_distance))
 
-    for x1, y1, x2, y2 in lines.reshape(-1, 4):
-        dx, dy = int(x2 - x1), int(y2 - y1)
+    line_pairs = find_parallel_pairs(simplified_segments, wall_thickness)
 
-        horizontal = abs(dx) >= abs(dy)
-        line_overlay = horizontal_hough_overlay if horizontal else vertical_hough_overlay
-        cv2.line(
-            line_overlay,
-            (int(x1), int(y1)),
-            (int(x2), int(y2)),
-            (0, 0, 255),
-            1,
+    rectangles = []
+
+    for line_a, line_b in line_pairs:
+        _, horizontal, pos_a, start_a, end_a = line_a
+        _, _, pos_b, start_b, end_b = line_b
+
+        start = min(start_a, start_b)
+        end = max(end_a, end_b)
+
+        if start >= end:
+            continue
+
+        if horizontal:
+            top, bottom = sorted((pos_a, pos_b))
+            corners = (
+                (int(round(start)), int(round(top))),
+                (int(round(end)), int(round(top))),
+                (int(round(start)), int(round(bottom))),
+                (int(round(end)), int(round(bottom)))
+            )
+            horizontal = True
+        else:
+            left, right = sorted((pos_a, pos_b))
+            corners = (
+                (int(round(left)), int(round(start))),
+                (int(round(right)), int(round(start))),
+                (int(round(left)), int(round(end))),
+                (int(round(right)), int(round(end)))
+            )
+            horizontal = False
+
+        rectangles.append((horizontal, corners))
+
+    rectangles = filter_wall_rectangles(rectangles, otsu_image)
+    rectangles = expand_rectangles(
+        rectangles, margin=2, image_shape=binary_image.shape
+    )
+
+    return {
+        "wall_rectangles": rectangles,
+        "otsu_image": otsu_image,
+        "core_image": core,
+        "edge_image": edge_image,
+        "segments": segments,
+        "simplified_segments": simplified_segments,
+    }
+
+
+def recognize_opening_in_wall(wall_rectangles, threshold):
+    # Find gaps between consecutive wall rectangles in the same aligned band.
+    gaps = []
+
+    horizontal_walls = []
+    vertical_walls = []
+
+    for horizontal, corners in wall_rectangles:
+        if horizontal:
+            horizontal_walls.append(corners)
+        else:
+            vertical_walls.append(corners)
+
+    # Wände mit (x1, y1), (x2, y2), (x3, y3) und (x4, y4):
+    # (x1, y1), (x2, y2)
+    # (x4, y4), (x3, y3)
+    # da es symmetrisch ist, sind alle parallelen Seiten gleich lang:
+    # (x1, y1), (x2, y1)
+    # (x1, y2), (x2, y2)
+    # also: (x1, y1), (x2, y1), (x1, y2), (x2, y2)
+
+    if len(horizontal_walls) == 0 and len(vertical_walls) == 0:
+        print("Keine Wände")
+
+    for i in range(1, len(horizontal_walls)):
+        (x1, y1), (x2, y1), (x1, y2), (x2, y2) = horizontal_walls[i]
+
+        for j in range(i + 1, len(horizontal_walls)):
+            (x3, y3), (x4, y3), (x3, y4), (x4, y4) = horizontal_walls[j]
+            # check ob die y-Werte ungefähr so sind, dass die auf der selben Höhe sind
+            # y3 ist kleiner als y4
+            if y1 < y4 and y2 > y3:
+                # Check ob die Wände nicht ineinander sind
+                if x1 > x4:
+                    y_wert_1 = int(min(y1, y3) - threshold)
+                    y_wert_2 = int(max(y2, y4) + threshold)
+                    gap_corners = ((x4, y_wert_1), (x1, y_wert_1), (x4, y_wert_2), (x1, y_wert_2))
+
+                elif x2 < x3:
+                    y_wert_1 = int(min(y1, y3) - threshold)
+                    y_wert_2 = int(max(y2, y4) + threshold)
+                    gap_corners = ((x2, y_wert_1), (x3, y_wert_1), (x2, y_wert_2), (x3, y_wert_2))
+
+                gaps.append(gap_corners)
+
+    for i in range(1, len(vertical_walls)):
+        (x1, y1), (x2, y1), (x1, y2), (x2, y2) = vertical_walls[i]
+
+        for j in range(i + 1, len(vertical_walls)):
+            (x3, y3), (x4, y3), (x3, y4), (x4, y4) = vertical_walls[j]
+            # check ob die x-Werte ungefähr so sind, dass die auf der selben Höhe sind
+            # x3 ist kleiner als x4
+            if x1 < x4 and x2 > x3:
+                # Check ob die Wände nicht ineinander sind
+                if y1 > y4:
+                    x_wert_1 = int(min(x1, x3) - threshold)
+                    x_wert_2 = int(max(x2, x4) + threshold)
+                    gap_corners = ((x_wert_1, y4), (x_wert_2, y4), (x_wert_1, y1), (x_wert_2, y1))
+
+                elif y2 < y3:
+                    x_wert_1 = int(min(x1, x3) - threshold)
+                    x_wert_2 = int(max(x2, x4) + threshold)
+                    gap_corners = ((x_wert_1, y2), (x_wert_2, y2), (x_wert_1, y3), (x_wert_2, y3))
+
+                gaps.append(gap_corners)
+
+    #
+    #
+    #
+    #
+    # doppelt und dreifache Gaps werden erkannt, weil es keine max größe für die Lücken hat
+    # füge max Lückenlänge und eine Wand kann nur jeweils ein Fenster an einem Ende haben und nicht mehrere
+    #
+    #
+    #
+    #
+
+    return gaps
+
+def segments_helper(segments, epsilon=2):
+    simplified_segments = []
+
+    for segment in segments:
+        points = np.asarray(segment, dtype=np.int32).reshape(-1, 1, 2)
+
+        if len(points) < 2:
+            continue
+
+        corners = cv2.approxPolyDP(
+            points, epsilon=epsilon, closed=False
+        ).reshape(-1, 2)
+
+        simplified_segments.append([tuple(map(int, point)) for point in corners])
+
+    return simplified_segments
+
+
+def find_parallel_pairs(simplified_segments, wall_thickness):
+    lines = []
+
+    for segment_id, segment in enumerate(simplified_segments):
+        for point_a, point_b in zip(segment[:-1], segment[1:]):
+            x1, y1 = point_a
+            x2, y2 = point_b
+            dx, dy = abs(x2 - x1), abs(y2 - y1)
+
+            if dx == 0 and dy == 0:
+                continue
+            if dy < dx:
+                horizontal = True
+                position = (y1 + y2) / 2
+                start, end = sorted((x1, x2))
+            else:
+                horizontal = False
+                position = (x1 + x2) / 2
+                start, end = sorted((y1, y2))
+
+            lines.append((segment_id, horizontal, position, start, end))
+
+    pairs = []
+    for i, line_a in enumerate(lines):
+        for j in range(i + 1, len(lines)):
+            line_b = lines[j]
+            if line_a[1] != line_b[1]:
+                continue
+
+            distance = abs(line_a[2] - line_b[2])
+            overlap = min(line_a[4], line_b[4]) - max(line_a[3], line_b[3])
+
+            if 0 < distance <= wall_thickness and overlap > 0:
+                pairs.append((line_a, line_b))
+
+    return pairs
+
+
+# Filtert die Wandrechtecke basierend auf Fläschenüberdeckung mit einem Bild
+def filter_wall_rectangles(rectangles, wall_image, min_support=0.5):
+    accepted = []
+
+    for corners in rectangles:
+        rectangel_mask = np.zeros_like(wall_image)
+        polygon = np.asarray(corners)
+        cv2.fillConvexPoly(rectangel_mask, polygon, 255)
+
+        inside = rectangel_mask > 0
+        area = np.count_nonzero(inside)
+        if area == 0:
+            continue
+
+        support = np.count_nonzero(wall_image[inside] > 0) / area
+
+        if support >= min_support:
+            accepted.append(corners)
+
+    return accepted
+
+def expand_rectangles(rectangles, margin, image_shape):
+    height, width = image_shape
+    expanded = []
+
+    for corners in rectangles:
+        xs = [point[0] for point in corners]
+        ys = [point[1] for point in corners]
+        left = max(0, min(xs) - margin)
+        right = min(width - 1, max(xs) + margin)
+        top = max(0, min(ys) - margin)
+        bottom = min(height - 1, max(ys) + margin)
+
+        expanded.append(
+            (
+                (left, top),
+                (right, top),
+                (right, bottom),
+                (left, bottom),
+            )
         )
 
-        # Daten so speicher, dass man aus denen ein Rechteck bilden kann
-        if horizontal:
-            coord, start, end = (y1 + y2) / 2, min(x1, x2), max(x1, x2)
-
-        else:
-            coord, start, end = (x1 + x2) / 2, min(y1, y2), max(y1, y2)
-        
-        raw_segments.append((horizontal, coord, int(start), int(end)))
-
-    # Gruppiere doppelte Ereknnungen anhand ihrer Ausrichtung, Behalte Gruppen-ID, damit
-    # Öffnungserkennung später nur Linienabschnitte vergleichen kann, die zur gleichen Achse gehören
-    # Hough kann Wandverbindungen von benachbarten Mittellinien die selbe Wand_linie erkennen
-    # Gruppiere diese Linien innerhalb eines etwas größeren Abstand als zuvor
-    # Getrennte parallele Wände sollen weiterhin voneinander getrennt bleiben
-    # In kurz, gruppiere die von Hough erkannten Liniensegments in Abschnitte, damit doppelte
-    # oder leicht versetzte Treffer später nicht als viele verschiedene Wände behandelt werden
-
-    # Toleranz fur die Position, also der maximale Abstand bei denen wwei parallele Segmente
-    # noch als selbe Wandspur gelten
-    pos_tol = core_threshold * 2.0
-
-    # sortiere Lines in horizontale und vertikale(nicht horizontale) Linien
-    ordered_segments = []
-
-    for horizontal in (True, False):
-        ordered = sorted((s for s in raw_segments if s[0] == horizontal), key=lambda s: s[1])
-        ordered_segments.append((horizontal, ordered))
-        # speichere Segmente basierend auf Position der y-Achse in eine Liste
-        # dabei soll y-Achse sich anpassen
-        grouped = []
-        group_id = 0
-        
-        for horizontal, ordered in ordered_segments:
-            # Wenn bands leer ist oder Segmente nicht nah genug sind,
-            # kreiere neues Segment mit der Position
-            bands = []
-
-
-            for segment in ordered:
-                # wenn bands leer ist oder der positions Wert zu weit entfernt ist, kreiere neues bands-segment
-                if not bands or segment[1] - bands[-1][0] > pos_tol:
-                    bands.append([segment[1], [segment]])
-                
-                # falls Position nah genaug ist, verbinde es mit existierendem Segmenten und berechne
-                # die Position neu, da ordered soritert ist, muss es nicht durch alle Elemente gehen,
-                # sondern nur das letzte Element in bands ansprechen, positions Wert muss sich deswegen anpassen,
-                # weil sonst spätere Linien nicht mehr angesprochen werden, die eigentlich dazu passen, nutze median
-                else:
-                    bands[-1][1].append(segment)
-                    # berechne median, damit es sich anpasst
-                    bands[-1][0] = float(np.median([item[1] for item in bands[-1][1]]))
-
-            for coord, band in bands:
-                intervals = []
-                # start und end Punkte müssen sortiert werden, da Beispielsweise für bands:
-                # (True, 25, 19, 20)
-                # (True, 25, 18, 30)
-                # (True, 25, 10, 15)
-                # kann es zu Probleme mit diesen Werten kommen, deswegen erst sortieren
-
-                for start, end in sorted([(s[2], s[3]) for s in band]):
-                    # Verbinde überlappende oder nahe Linien
-                    # Echte gaps müssen trotzdem bleiben
-
-                    # start <= intervals[-1][1] + toleranz, also start <= vorheriuges Ende + toleranz --> keine Lücke
-                    if intervals and start <= intervals[-1][1] + pos_tol:
-                        intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
-                    # start > intervals[-1][1] + toleranz, also start > vorheriuges Ende + toleranz --> eine Lücke, neuer Eintrag
-                    else: 
-                        intervals.append((start, end))
-                grouped.extend((horizontal, group_id, int(round(coord)), a, b) for a, b in intervals)
-                group_id += 1
-
-        # grouped kann so aussehen:
-        # (True,  0,  25, 10, 30),
-        # (True,  0,  25, 40, 50),
-        # (True,  1, 100,  5, 45),
-        # (False, 2,  70, 12, 60),
-        # (False, 2,  70, 75, 90)
-        # selbe group_id, bedeutet, die gleichen y-Wert/x-Wert, fals horizontal/vertikal
-        # kann man aber ignorieren, muss einfach nur darüber iterieren und Rechtecke bilden, dicke muss ausgerechnet werden
-        wall_rectangle = []
-        for horizontal, band_id, coord, start, end in grouped:
-            # breite der Rechtecke berechnen
-            if horizontal:
-                coords = np.arange(start, end + 1, dtype=int)
-                xs = np.clip(coords, 0, width - 1)
-                ys = np.full(xs.shape, np.clip(coord, 0, height -1), dtype = int)
-            else:
-                coords = np.arange(start, end + 1, dtype=int)
-                ys = np.clip(coords, 0, height - 1)
-                xs = np.full(ys.shape, np.clip(coord, 0, width - 1), dtype=int)
-
-            rec_distance = distance[ys, xs]
-            rec_distance = rec_distance[rec_distance > 0]
-            if rec_distance.size == 0:
-                continue
-            half_thickness = max(1, int(round(float(np.mean(rec_distance)) + core_threshold)))
-
-            if end - start < 2 * half_thickness:
-                continue
-
-            if horizontal:
-                corners = [
-                    (int(start), int(coord - half_thickness)),
-                    (int(end), int( coord - half_thickness)),
-                    (int(end), int(coord + half_thickness)),
-                    (int(start), int(coord + half_thickness)),
-                ]
-            else:
-                corners = [
-                    (int(coord - half_thickness), int(start)),
-                    (int(coord + half_thickness), int(start)),
-                    (int(coord + half_thickness), int(end)),
-                    (int(coord - half_thickness), int(end)),
-                ]
-
-            wall_rectangle.append(corners)
-                
-    return (
-        wall_rectangle,
-        spatial_otsu_image,
-        core,
-        horizontal_hough_overlay,
-        vertical_hough_overlay,
-    )
+    return expanded

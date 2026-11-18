@@ -1,11 +1,34 @@
 import cv2
 import numpy as np
-from itertools import combinations
 
 
-def analyze_structures(binary_image):
+def analyze_structures(binary_image, original_image=None):
+    wall_rectangles = extract_wall_candidates(binary_image)
+    wall_gaps_pos = recognize_opening_in_wall(wall_rectangles)
+    gap_line = wall_gap_interpreter(
+        wall_gaps_pos,
+        binary_image,
+        original_image,
+    )
+    (
+        window_pos,
+        door_pos,
+        rest_gap_pos,
+        parallel_group_counts,
+        door_window_threshold,
+        classified_openings,
+    ) = window_or_door(gap_line)
 
-    return extract_wall_candidates(binary_image)
+    return (
+        wall_rectangles,
+        window_pos,
+        door_pos,
+        rest_gap_pos,
+        gap_line,
+        parallel_group_counts,
+        door_window_threshold,
+        classified_openings,
+    )
 
 
 def extract_wall_candidates(binary_image):
@@ -21,14 +44,7 @@ def extract_wall_candidates(binary_image):
 
     # Wenn forgorund_distance keine Werte hat, gibt es keine Wände
     if foreground_distances.size == 0:
-        return {
-            "wall_rectangles": [],
-            "otsu_image": otsu_image,
-            "core_image": core,
-            "edge_image": core.copy(),
-            "segments": [],
-            "simplified_segments": [],
-        }
+        return []
 
     # Otsu ist ein Verfahren zur automatischen Bestimmung eines Schwellenwertes,
     # eignet sich, wenn es wenn man Daten in 2 Kategorien unterteilen will
@@ -117,14 +133,7 @@ def extract_wall_candidates(binary_image):
         rectangles, margin=2, image_shape=binary_image.shape
     )
 
-    return {
-        "wall_rectangles": rectangles,
-        "otsu_image": otsu_image,
-        "core_image": core,
-        "edge_image": edge_image,
-        "segments": segments,
-        "simplified_segments": simplified_segments,
-    }
+    return rectangles
 
 
 def recognize_opening_in_wall(wall_rectangles, threshold=0):
@@ -176,9 +185,15 @@ def recognize_opening_in_wall(wall_rectangles, threshold=0):
     return openings
 
 
-def wall_gap_interpreter(wall_openings, binary_image):
+def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
     gap_mask = np.zeros_like(binary_image)
     opening_regions = []
+    if original_image is None:
+        original_gray = binary_image
+    elif original_image.ndim == 3:
+        original_gray = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
+    else:
+        original_gray = original_image
 
     for opening_id, opening in enumerate(wall_openings):
         polygon = np.asarray(opening, dtype=np.int32)
@@ -199,15 +214,66 @@ def wall_gap_interpreter(wall_openings, binary_image):
     for region in opening_regions:
         left, top, right, bottom = region["bounds"]
         gap_roi = gap_image[top:bottom + 1, left:right + 1]
-        wall_thickness = max(1, int(round(min(right - left, bottom - top))))
+        gap_width = right - left + 1
+        gap_height = bottom - top + 1
+        gap_orientation = (
+            "horizontal" if gap_width >= gap_height else "vertical"
+        )
+        wall_thickness = (
+            gap_height if gap_orientation == "horizontal" else gap_width
+        )
+        wall_thickness = max(1, int(round(wall_thickness)))
+        door_arc = has_quarter_circle_arc(
+            binary_image,
+            region["corners"],
+            wall_thickness,
+        )
 
         if not np.any(gap_roi):
             parallel_groups = []
+            gap_segments = []
         else:
-            outlines = cv2.ximgproc.createEdgeDrawing()
-            outlines.detectEdges(gap_roi)
-            segments = outlines.getSegments() or []
-            simplified_segments = segments_helper(segments)
+            if original_image is None:
+                gap_source = gap_roi
+            elif original_image.ndim == 3:
+                original_gray = cv2.cvtColor(
+                    original_image,
+                    cv2.COLOR_BGR2GRAY,
+                )
+                gap_source = original_gray[
+                    top:bottom + 1,
+                    left:right + 1,
+                ]
+            else:
+                gap_source = original_image[
+                    top:bottom + 1,
+                    left:right + 1,
+                ]
+
+            gap_edges = cv2.Canny(gap_source, 50, 150)
+            hough_lines = cv2.HoughLinesP(
+                gap_edges,
+                rho=1,
+                theta=np.pi / 180,
+                threshold=15,
+                minLineLength=12,
+                maxLineGap=3,
+            )
+
+            simplified_segments = []
+            gap_segments = []
+            if hough_lines is not None:
+                for x1, y1, x2, y2 in hough_lines.reshape(-1, 4):
+                    segment = [
+                        (int(x1), int(y1)),
+                        (int(x2), int(y2)),
+                    ]
+                    simplified_segments.append(segment)
+                    gap_segments.append([
+                        (int(x1) + left, int(y1) + top),
+                        (int(x2) + left, int(y2) + top),
+                    ])
+
             parallel_groups = find_parallel_groups(
                 simplified_segments, wall_thickness=wall_thickness
             )
@@ -216,18 +282,217 @@ def wall_gap_interpreter(wall_openings, binary_image):
             "opening_id": region["opening_id"],
             "corners": region["corners"],
             "wall_thickness": wall_thickness,
+            "gap_orientation": gap_orientation,
             "parallel_groups": parallel_groups,
+            "door_arc": door_arc,
+            "gap_segments": gap_segments,
         })
 
     return results
 
 
-def window_or_door(openings):
+def has_quarter_circle_arc(binary_image, corners, gap_thickness):
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    gap_width = max(xs) - min(xs)
+    gap_height = max(ys) - min(ys)
+
+    margin = max(12, int(round(max(gap_width, gap_height) * 0.75)))
+    height, width = binary_image.shape
+    left = max(0, min(xs) - margin)
+    right = min(width - 1, max(xs) + margin)
+    top = max(0, min(ys) - margin)
+    bottom = min(height - 1, max(ys) + margin)
+
+    roi = binary_image[top:bottom + 1, left:right + 1]
+    if roi.size == 0:
+        return False
+
+    edges = cv2.Canny(roi, 50, 150)
+    min_radius = max(4, int(round(min(gap_width, gap_height) * 0.15)))
+    max_radius = max(
+        min_radius + 1,
+        int(round(max(gap_width, gap_height) * 1.25)),
+    )
+
+    circles = cv2.HoughCircles(
+        edges,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(12, gap_thickness),
+        param1=100,
+        param2=18,
+        minRadius=min_radius,
+        maxRadius=max_radius,
+    )
+    if circles is None:
+        return False
+
+    absolute_corners = [(int(x), int(y)) for x, y in corners]
+    for cx, cy, radius in np.round(circles[0]).astype(int):
+        circle_center = (left + int(cx), top + int(cy))
+
+        touches_gap_corner = any(
+            abs(circle_center[0] - corner_x) <= radius * 0.45
+            and abs(circle_center[1] - corner_y) <= radius * 0.45
+            for corner_x, corner_y in absolute_corners
+        )
+        if not touches_gap_corner:
+            continue
+
+        quadrant_counts = [0, 0, 0, 0]
+        sample_count = 48
+        for index in range(sample_count):
+            angle = 2 * np.pi * index / sample_count
+            sx = int(round(cx + radius * np.cos(angle)))
+            sy = int(round(cy + radius * np.sin(angle)))
+
+            if sy < 0 or sy >= edges.shape[0] or sx < 0 or sx >= edges.shape[1]:
+                continue
+
+            if edges[sy, sx] == 0:
+                continue
+
+            if sx >= cx and sy < cy:
+                quadrant = 0
+            elif sx < cx and sy < cy:
+                quadrant = 1
+            elif sx < cx and sy >= cy:
+                quadrant = 2
+            else:
+                quadrant = 3
+            quadrant_counts[quadrant] += 1
+
+        occupied_quadrants = sum(count >= 3 for count in quadrant_counts)
+        strongest_quadrant = max(quadrant_counts)
+        if occupied_quadrants <= 2 and strongest_quadrant >= 5:
+            return True
+
+    return False
+
+
+def classify_parallel_threshold(parallel_counts):
+    # 0 und 1 werden als leere beziehungsweise nicht verwertbare Gruppen behandelt.
+    relevant_values = sorted({
+        int(value)
+        for value in parallel_counts
+        if value >= 2
+    })
+
+    # Ohne positive Werte gibt es weder eine Tür- noch eine Fenstergrenze.
+    if not relevant_values:
+        return None
+
+    # Bei genau einem Wert wird dieser Wert als Übergangspunkt verwendet.
+    if len(relevant_values) == 1:
+        return relevant_values[0]
+
+    # Bei genau zwei Werten trennt ihre Mitte Tür- und Fensterbereich.
+    if len(relevant_values) == 2:
+        return (relevant_values[0] + relevant_values[1]) / 2
+
+    # Bei genau drei Werten liegt der mittlere Wert auf der Grenze.
+    if len(relevant_values) == 3:
+        return relevant_values[1]
+
+    # Bei vier oder mehr Werten wird der Wert mit der größten Summe seiner
+    # direkten Nachbarabstände gewählt. Das beschränkt die Bewertung auf
+    # die lokale Trennung und vermeidet, dass Extremwerte alle Summe bestimmen.
+    maximum_separation = -1
+    threshold = None
+    for index, value in enumerate(relevant_values):
+        neighbor_distances = []
+        if index > 0:
+            neighbor_distances.append(value - relevant_values[index - 1])
+        if index < len(relevant_values) - 1:
+            neighbor_distances.append(relevant_values[index + 1] - value)
+        distance_sum = sum(neighbor_distances)
+        if distance_sum > maximum_separation:
+            maximum_separation = distance_sum
+            threshold = value
+
+    return threshold
+
+
+def classify_opening_by_count(parallel_count, threshold, door_arc):
+    # Werte ohne verwertbare Linie gehören immer zu something_else.
+    if parallel_count < 2:
+        return "unknown"
+
+    # Kein eindeutiger Grenzwert bedeutet: exakt der Einzelwert wird
+    # geometrisch geprüft und nur mit einem Bogen als Tür gewertet.
+    if threshold is None:
+        return "door" if door_arc else "unknown"
+
+    # Kleiner als der Grenzwert gehört zur Türseite.
+    if parallel_count < threshold:
+        return "door"
+
+    # Größer als der Grenzwert ist die Fensterseite.
+    if parallel_count > threshold:
+        return "window"
+
+    # Der genaue Grenzwert muss geometrisch geprüft werden.
+    return "door" if door_arc else "window"
+
+
+def window_or_door(openings_wall):
     window = []
     door = []
     something_else = []
+    parallel_group_lengths = []
 
-    return
+    for opening in openings_wall:
+        parallel_groups = opening["parallel_groups"]
+        parallel_count = max(
+            (len(group) for group in parallel_groups),
+            default=0,
+        )
+        parallel_group_lengths.append(parallel_count)
+
+    threshold = classify_parallel_threshold(parallel_group_lengths)
+
+    classified_openings = []
+
+    for opening in openings_wall:
+        corners = opening["corners"]
+        parallel_groups = opening["parallel_groups"]
+        door_arc = opening.get("door_arc", False)
+        opening_id = opening["opening_id"]
+
+        parallel_count = max(
+            (len(group) for group in parallel_groups),
+            default=0,
+        )
+        classification = classify_opening_by_count(
+            parallel_count,
+            threshold,
+            door_arc,
+        )
+
+        if classification == "door":
+            door.append(corners)
+        elif classification == "window":
+            window.append(corners)
+        else:
+            something_else.append(corners)
+
+        classified_openings.append({
+            "opening_id": opening_id,
+            "corners": corners,
+            "parallel_count": parallel_count,
+            "door_arc": door_arc,
+            "classification": classification,
+        })
+
+    return (
+        window,
+        door,
+        something_else,
+        parallel_group_lengths,
+        threshold,
+        classified_openings,
+    )
 
 
 def segments_helper(segments, epsilon=2):
@@ -290,37 +555,59 @@ def find_parallel_pairs(simplified_segments, wall_thickness):
 # Für die Wandöffnungen
 
 def find_parallel_groups(simplified_segments, wall_thickness):
-    pairs = find_parallel_pairs(simplified_segments, wall_thickness)
+    lines = []
 
-    pair_links = {frozenset(pair) for pair in pairs}
-    lines = {line for pair in pairs for line in pair}
+    for segment_id, segment in enumerate(simplified_segments):
+        for point_a, point_b in zip(segment[:-1], segment[1:]):
+            x1, y1 = point_a
+            x2, y2 = point_b
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+
+            if dx == 0 and dy == 0:
+                continue
+
+            if dy < dx:
+                horizontal = True
+                position = (y1 + y2) / 2
+                start, end = sorted((x1, x2))
+            else:
+                horizontal = False
+                position = (x1 + x2) / 2
+                start, end = sorted((y1, y2))
+
+            lines.append(
+                (segment_id, horizontal, position, start, end)
+            )
 
     groups = []
-    used_lines = set()
+    position_tolerance = max(2, float(wall_thickness))
 
-    # Erst Dreiergruppen suchen, damit sie Vorrang vor einzelnen Paaren haben.
-    triplets = []
-    for combination in combinations(lines, 3):
-        ordered = tuple(sorted(combination, key=lambda line: line[2]))
-        first, middle, last = ordered
+    for horizontal in (True, False):
+        orientated_lines = sorted(
+            (line for line in lines if line[1] == horizontal),
+            key=lambda line: line[2],
+        )
 
-        if (
-            first[1] == middle[1] == last[1]
-            and frozenset((first, middle)) in pair_links
-            and frozenset((middle, last)) in pair_links
-        ):
-            triplets.append(ordered)
+        clusters = []
+        for line in orientated_lines:
+            if not clusters:
+                clusters.append([line])
+                continue
 
-    for triplet in triplets:
-        if not any(line in used_lines for line in triplet):
-            groups.append(triplet)
-            used_lines.update(triplet)
+            previous = clusters[-1]
+            previous_position = previous[-1][2]
 
-    # Übrig gebliebene erkannte Paare als Zweier-Tupel ergänzen.
-    for pair in pairs:
-        if not any(line in used_lines for line in pair):
-            groups.append(pair)
-            used_lines.update(pair)
+            if abs(line[2] - previous_position) <= position_tolerance:
+                previous.append(line)
+            else:
+                clusters.append([line])
+
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+
+            groups.append(tuple(cluster))
 
     return groups
 

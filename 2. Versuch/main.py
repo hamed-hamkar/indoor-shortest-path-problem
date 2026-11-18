@@ -6,61 +6,54 @@ from preprocessing import preprocess_image
 from structure_rec import analyze_structures, recognize_opening_in_wall
 
 
-# Bild verarbeiten
 project_dir = Path(__file__).resolve().parent.parent
 image_path = project_dir / "Bilder" / "Floor_Test_1.png"
 images = preprocess_image(str(image_path))
-structures = analyze_structures(images["binary"])
-
-original = images["original"]
-rectangles_overlay = original.copy()
-gap_rectangles = recognize_opening_in_wall(
-    structures["wall_rectangles"], threshold=0
+(
+    wall_rectangles,
+    window_rectangles,
+    door_rectangles,
+    rest_gap_rectangles,
+    gap_analysis,
+    parallel_group_lengths,
+    door_window_threshold,
+    classified_openings,
+) = analyze_structures(
+    images["binary"],
+    images["original"],
 )
-gaps_overlay = original.copy()
+gap_rectangles = recognize_opening_in_wall(wall_rectangles, threshold=0)
 
+hough_lines_overlay = np.zeros_like(images["binary"], dtype=np.uint8)
+hough_lines_overlay = cv2.cvtColor(
+    hough_lines_overlay,
+    cv2.COLOR_GRAY2BGR,
+)
 
-def draw_gaps_on_image(image, gaps):
-    if image.ndim == 2:
-        overlay = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    else:
-        overlay = image.copy()
+for gap_result in gap_analysis:
+    for segment in gap_result["gap_segments"]:
+        for point_a, point_b in zip(segment[:-1], segment[1:]):
+            cv2.line(
+                hough_lines_overlay,
+                (int(point_a[0]), int(point_a[1])),
+                (int(point_b[0]), int(point_b[1])),
+                (0, 255, 255),
+                1,
+            )
 
-    for gap in gaps:
-        points = np.asarray(gap, dtype=np.int32)
-        polygon = cv2.convexHull(points).reshape(-1, 1, 2)
-        cv2.polylines(overlay, [polygon], True, (0, 0, 255), 2)
-
-    return overlay
-
-
-for rectangle in structures["wall_rectangles"]:
-    corners = np.asarray(rectangle["corners"], dtype=np.int32).reshape(-1, 1, 2)
-    cv2.polylines(rectangles_overlay, [corners], True, (0, 255, 255), 2)
-
-gap_mask = np.zeros_like(images["binary"])
 for gap in gap_rectangles:
-    polygon = np.asarray(gap, dtype=np.int32)
-    cv2.fillConvexPoly(gap_mask, polygon, 255)
+    polygon = np.asarray(gap, dtype=np.int32).reshape(-1, 1, 2)
+    cv2.polylines(
+        hough_lines_overlay,
+        [polygon],
+        True,
+        (0, 0, 255),
+        1,
+    )
 
-binary_pixels_in_gaps = cv2.bitwise_and(images["binary"], gap_mask)
-gaps_on_binary = draw_gaps_on_image(images["binary"], gap_rectangles)
-gaps_overlay = draw_gaps_on_image(gaps_overlay, gap_rectangles)
+print("parallel_group_counts:", parallel_group_lengths)
+print("door_window_threshold:", door_window_threshold)
 
-combined_overlay = rectangles_overlay.copy()
-combined_overlay = draw_gaps_on_image(combined_overlay, gap_rectangles)
-
-
-cv2.imshow("otsu_image", structures["otsu_image"])
-cv2.imshow("Core input", structures["core_image"])
-cv2.imshow("EdgeDrawing edges", structures["edge_image"])
-cv2.imshow("Filtered wall rectangles", rectangles_overlay)
-cv2.imshow("Gap rectangles", gaps_overlay)
-cv2.imshow("Walls and gap rectangles", combined_overlay)
-cv2.imshow("Gap outlines on binary image", gaps_on_binary)
-cv2.imshow("Binary pixels inside wall gaps", binary_pixels_in_gaps)
-print("Lücken-Rechtecke:", len(gap_rectangles))
-
-
+cv2.imshow("Hough lines in gaps", hough_lines_overlay)
 cv2.waitKey(0)
 cv2.destroyAllWindows()

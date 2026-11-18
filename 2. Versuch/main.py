@@ -38,6 +38,12 @@ for rectangle in structures["wall_rectangles"]:
     corners = np.asarray(rectangle["corners"], dtype=np.int32).reshape(-1, 1, 2)
     cv2.polylines(rectangles_overlay, [corners], True, (0, 255, 255), 2)
 
+gap_mask = np.zeros_like(images["binary"])
+for gap in gap_rectangles:
+    polygon = np.asarray(gap, dtype=np.int32)
+    cv2.fillConvexPoly(gap_mask, polygon, 255)
+
+binary_pixels_in_gaps = cv2.bitwise_and(images["binary"], gap_mask)
 gaps_on_binary = draw_gaps_on_image(images["binary"], gap_rectangles)
 gaps_overlay = draw_gaps_on_image(gaps_overlay, gap_rectangles)
 
@@ -51,7 +57,8 @@ cv2.imshow("EdgeDrawing edges", structures["edge_image"])
 cv2.imshow("Filtered wall rectangles", rectangles_overlay)
 cv2.imshow("Gap rectangles", gaps_overlay)
 cv2.imshow("Walls and gap rectangles", combined_overlay)
-cv2.imshow("Gaps on binary image", gaps_on_binary)
+cv2.imshow("Gap outlines on binary image", gaps_on_binary)
+cv2.imshow("Binary pixels inside wall gaps", binary_pixels_in_gaps)
 print("Lücken-Rechtecke:", len(gap_rectangles))
 
 

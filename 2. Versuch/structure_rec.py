@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from itertools import combinations
 
 
 def analyze_structures(binary_image):
@@ -174,6 +175,61 @@ def recognize_opening_in_wall(wall_rectangles, threshold=0):
 
     return openings
 
+
+def wall_gap_interpreter(wall_openings, binary_image):
+    gap_mask = np.zeros_like(binary_image)
+    opening_regions = []
+
+    for opening_id, opening in enumerate(wall_openings):
+        polygon = np.asarray(opening, dtype=np.int32)
+        cv2.fillConvexPoly(gap_mask, polygon, 255)
+
+        xs = polygon[:, 0]
+        ys = polygon[:, 1]
+        opening_regions.append({
+            "opening_id": opening_id,
+            "corners": opening,
+            "bounds": (xs.min(), ys.min(), xs.max(), ys.max()),
+        })
+
+    gap_image = cv2.bitwise_and(binary_image, gap_mask)
+
+    results = []
+
+    for region in opening_regions:
+        left, top, right, bottom = region["bounds"]
+        gap_roi = gap_image[top:bottom + 1, left:right + 1]
+        wall_thickness = max(1, int(round(min(right - left, bottom - top))))
+
+        if not np.any(gap_roi):
+            parallel_groups = []
+        else:
+            outlines = cv2.ximgproc.createEdgeDrawing()
+            outlines.detectEdges(gap_roi)
+            segments = outlines.getSegments() or []
+            simplified_segments = segments_helper(segments)
+            parallel_groups = find_parallel_groups(
+                simplified_segments, wall_thickness=wall_thickness
+            )
+
+        results.append({
+            "opening_id": region["opening_id"],
+            "corners": region["corners"],
+            "wall_thickness": wall_thickness,
+            "parallel_groups": parallel_groups,
+        })
+
+    return results
+
+
+def window_or_door(openings):
+    window = []
+    door = []
+    something_else = []
+
+    return
+
+
 def segments_helper(segments, epsilon=2):
     simplified_segments = []
 
@@ -192,6 +248,7 @@ def segments_helper(segments, epsilon=2):
     return simplified_segments
 
 
+# Für die Wände
 def find_parallel_pairs(simplified_segments, wall_thickness):
     lines = []
 
@@ -228,6 +285,44 @@ def find_parallel_pairs(simplified_segments, wall_thickness):
                 pairs.append((line_a, line_b))
 
     return pairs
+
+
+# Für die Wandöffnungen
+
+def find_parallel_groups(simplified_segments, wall_thickness):
+    pairs = find_parallel_pairs(simplified_segments, wall_thickness)
+
+    pair_links = {frozenset(pair) for pair in pairs}
+    lines = {line for pair in pairs for line in pair}
+
+    groups = []
+    used_lines = set()
+
+    # Erst Dreiergruppen suchen, damit sie Vorrang vor einzelnen Paaren haben.
+    triplets = []
+    for combination in combinations(lines, 3):
+        ordered = tuple(sorted(combination, key=lambda line: line[2]))
+        first, middle, last = ordered
+
+        if (
+            first[1] == middle[1] == last[1]
+            and frozenset((first, middle)) in pair_links
+            and frozenset((middle, last)) in pair_links
+        ):
+            triplets.append(ordered)
+
+    for triplet in triplets:
+        if not any(line in used_lines for line in triplet):
+            groups.append(triplet)
+            used_lines.update(triplet)
+
+    # Übrig gebliebene erkannte Paare als Zweier-Tupel ergänzen.
+    for pair in pairs:
+        if not any(line in used_lines for line in pair):
+            groups.append(pair)
+            used_lines.update(pair)
+
+    return groups
 
 
 # Filtert die Wandrechtecke basierend auf Fläschenüberdeckung mit einem Bild

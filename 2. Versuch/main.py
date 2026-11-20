@@ -58,28 +58,15 @@ def main():
     for corners in window_rectangles:
         draw_labeled_polygon(result_image, corners, (0, 255, 0), "Fenster")
 
-    # Möbelkonturen als achsenparallele Rechtecke markieren.
-    for contour in furniture_contours:
-        x, y, width, height = cv2.boundingRect(contour)
-        if width < 2 or height < 2:
+    # Möbelgruppen mit ihren horizontalen und vertikalen Umrissen markieren.
+    for furniture_outline in furniture_contours:
+        if len(furniture_outline) < 3:
             continue
-
-        cv2.rectangle(
+        draw_labeled_polygon(
             result_image,
-            (x, y),
-            (x + width - 1, y + height - 1),
+            furniture_outline,
             (255, 0, 255),
-            2,
-        )
-        cv2.putText(
-            result_image,
             "Moebel",
-            (x, max(15, y - 4)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 0, 255),
-            1,
-            cv2.LINE_AA,
         )
 
     # Ein Fenster, ein Bild; es wird keine Datei gespeichert und nichts gedruckt.

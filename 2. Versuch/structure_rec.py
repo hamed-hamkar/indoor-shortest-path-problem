@@ -9,14 +9,13 @@ def analyze_structures(binary_image, original_image=None):
         binary_image,
         original_image,
     )
-    (
-        window_rectangles,
+    window_rectangles, door_rectangles = window_or_door(gap_line, binary_image)
+    furniture_rectangles = check_for_furniture(
+        binary_image,
+        wall_rectangles,
         door_rectangles,
-        parallel_group_counts,
-        door_window_threshold,
-        classified_openings,
-    ) = window_or_door(gap_line, binary_image)
-    furniture_rectangles = check_for_furniture(binary_image, wall_rectangles, door_rectangles, window_rectangles)
+        window_rectangles,
+    )
 
 
     return (
@@ -35,12 +34,12 @@ def extract_wall_candidates(binary_image):
 
     distance = cv2.distanceTransform(binary_image, cv2.DIST_L2, 5)
     foreground_distances = distance[binary_image > 0]
-    otsu_image = np.zeros_like(binary_image)
-    core = np.zeros_like(binary_image)
 
     # Wenn forgorund_distance keine Werte hat, gibt es keine Wände
     if foreground_distances.size == 0:
         return []
+
+    otsu_image = np.zeros_like(binary_image)
 
     # Otsu ist ein Verfahren zur automatischen Bestimmung eines Schwellenwertes,
     # eignet sich, wenn es wenn man Daten in 2 Kategorien unterteilen will
@@ -73,12 +72,10 @@ def extract_wall_candidates(binary_image):
     # nutze Edges, cv2.Canny(), cv2.findContours, cv2.approxPolyDP oder ed = cv2.ximgprox.createEdgeDrawing()
     # und dann ed.detectEdges() und dann ed.getSegments() und dann basierend auf den Linien-Punkten Rechtecke bilden
 
-    edge_image = np.zeros_like(core)
     segments = []
     if np.any(core):
         outlines = cv2.ximgproc.createEdgeDrawing()
         outlines.detectEdges(core)
-        edge_image = outlines.getEdgeImage()
         segments = outlines.getSegments() or []
 
     simplified_segments = segments_helper(segments)
@@ -182,10 +179,9 @@ def recognize_opening_in_wall(wall_rectangles, threshold=0):
 
 
 def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
-    gap_mask = np.zeros_like(binary_image)
     opening_regions = []
     if original_image is None:
-        original_gray = binary_image
+        original_gray = None
     elif original_image.ndim == 3:
         original_gray = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
     else:
@@ -193,8 +189,6 @@ def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
 
     for opening_id, opening in enumerate(wall_openings):
         polygon = np.asarray(opening, dtype=np.int32)
-        cv2.fillConvexPoly(gap_mask, polygon, 255)
-
         xs = polygon[:, 0]
         ys = polygon[:, 1]
         opening_regions.append({
@@ -203,13 +197,13 @@ def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
             "bounds": (xs.min(), ys.min(), xs.max(), ys.max()),
         })
 
-    gap_image = cv2.bitwise_and(binary_image, gap_mask)
-
     results = []
 
     for region in opening_regions:
         left, top, right, bottom = region["bounds"]
-        gap_roi = gap_image[top:bottom + 1, left:right + 1]
+        # Wall openings are axis-aligned rectangles, so crop the binary image
+        # directly instead of masking and copying the entire image first.
+        gap_roi = binary_image[top:bottom + 1, left:right + 1]
         gap_width = right - left + 1
         gap_height = bottom - top + 1
         gap_orientation = (
@@ -224,19 +218,10 @@ def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
             parallel_groups = []
             gap_segments = []
         else:
-            if original_image is None:
+            if original_gray is None:
                 gap_source = gap_roi
-            elif original_image.ndim == 3:
-                original_gray = cv2.cvtColor(
-                    original_image,
-                    cv2.COLOR_BGR2GRAY,
-                )
-                gap_source = original_gray[
-                    top:bottom + 1,
-                    left:right + 1,
-                ]
             else:
-                gap_source = original_image[
+                gap_source = original_gray[
                     top:bottom + 1,
                     left:right + 1,
                 ]
@@ -284,73 +269,50 @@ def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
 def window_or_door(openings_wall, binary_image):
     window = []
     door = []
-    something_else = []
-    parallel_group_lengths = []
+    parallel_group_lengths = [
+        max((len(group) for group in opening["parallel_groups"]), default=0)
+        for opening in openings_wall
+    ]
+    ink_points = np.column_stack(np.nonzero(binary_image))[:, ::-1]
 
-    # Berechne die Anzahl der parallelen Linien in den jeweiligen Gaps
-    for opening in openings_wall:
-        parallel_groups = opening["parallel_groups"]
-        parallel_count = max(
-            (len(group) for group in parallel_groups),
-            default=0,
-        )
-        parallel_group_lengths.append(parallel_count)
-
-    # Türen haben weniger parallele Linien als Fenster, finde den Threshold um something_else, Türen und Fenster zu unterteilen
+    # Determine the count threshold once for all openings.
     threshold = classify_parallel_threshold(parallel_group_lengths)
 
-    classified_openings = []
-
-    for opening in openings_wall:
+    for opening, parallel_count in zip(openings_wall, parallel_group_lengths):
         corners = opening["corners"]
-        parallel_groups = opening["parallel_groups"]
-        opening_id = opening["opening_id"]
         gap_thickness = opening["wall_thickness"]
         gap_orientation = opening["gap_orientation"]
 
-        parallel_count = max(
-            (len(group) for group in parallel_groups),
-            default=0,
+        needs_arc_check = (
+            parallel_count >= 2
+            and (threshold is None or parallel_count <= threshold)
         )
-
+        arc_geometry = None
+        if needs_arc_check:
+            arc_geometry = detect_door_arc_geometry(
+                binary_image,
+                corners,
+                gap_thickness,
+                gap_orientation,
+                ink_points,
+            )
         classification = classify_opening_by_count_and_arc(
             parallel_count,
             threshold,
-            binary_image,
-            corners,
-            gap_thickness,
-            gap_orientation
+            arc_geometry is not None,
         )
 
         if classification == "door":
             swing_area_corners = expand_door_swing_area(
                 corners,
-                gap_orientation,
+                arc_geometry,
                 binary_image.shape,
             )
             door.append(swing_area_corners)
         elif classification == "window":
             window.append(corners)
-        else:
-            something_else.append(corners)
 
-        classified_openings.append({
-            "opening_id": opening_id,
-            "corners": corners,
-            "swing_area_corners": (
-                swing_area_corners if classification == "door" else None
-            ),
-            "parallel_count": parallel_count,
-            "classification": classification,
-        })
-
-    return (
-        window,
-        door,
-        parallel_group_lengths,
-        threshold,
-        classified_openings,
-    )
+    return window, door
 
 
 
@@ -379,12 +341,15 @@ def check_for_furniture(
         mask=cv2.bitwise_not(everything_except_furniture_mask),
     )
 
+    # Keep nested contours temporarily so the positional filter below can
+    # remove furniture candidates enclosed by another candidate.
     furniture_contours, _ = cv2.findContours(
-        furniture_image.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+        furniture_image.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE
     )
-
+    furniture_contours = remove_small_contours(furniture_contours)
     furniture_contours = remove_contours_inside_other_contours(furniture_contours)
-    return remove_small_contours(furniture_contours)
+
+    return orthogonal_contours(furniture_contours, binary_image.shape)
 
 
 def remove_small_contours(contours, min_area=50.0):
@@ -431,6 +396,72 @@ def remove_contours_inside_other_contours(contours):
                 break
 
     return [contour for index, contour in enumerate(contours) if not contained[index]]
+
+
+def orthogonal_contours(contours, image_shape):
+    """Return one horizontal/vertical outline for each connected furniture group."""
+    if not contours:
+        return []
+
+    height, width = image_shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    # Filling all detected contours preserves connected groups while leaving
+    # spatially separate furniture as separate components.
+    cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
+
+    outer_contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    outlines = []
+    for contour in outer_contours:
+        boundary = contour.reshape(-1, 2)
+        if len(boundary) < 3:
+            continue
+
+        # CHAIN_APPROX_NONE gives adjacent boundary pixels. For diagonal steps,
+        # insert one corner pixel so every resulting edge is horizontal or
+        # vertical; this keeps the complete raster outline instead of
+        # simplifying away thin parts of a furniture symbol.
+        orthogonal = []
+        for index, point in enumerate(boundary):
+            next_point = boundary[(index + 1) % len(boundary)]
+            x1, y1 = map(int, point)
+            x2, y2 = map(int, next_point)
+            if x1 != x2 and y1 != y2:
+                orthogonal.append((x2, y1))
+            orthogonal.append((x2, y2))
+
+        # Drop duplicate and collinear points to keep the polygon compact.
+        cleaned = []
+        for point in orthogonal:
+            if not cleaned or point != cleaned[-1]:
+                cleaned.append(point)
+        if len(cleaned) > 2 and cleaned[0] == cleaned[-1]:
+            cleaned.pop()
+
+        changed = True
+        while changed and len(cleaned) > 3:
+            changed = False
+            simplified = []
+            count = len(cleaned)
+            for index, point in enumerate(cleaned):
+                previous = cleaned[(index - 1) % count]
+                following = cleaned[(index + 1) % count]
+                same_x = previous[0] == point[0] == following[0]
+                same_y = previous[1] == point[1] == following[1]
+                if same_x or same_y:
+                    changed = True
+                else:
+                    simplified.append(point)
+            if len(simplified) < 3:
+                break
+            cleaned = simplified
+
+        if len(cleaned) >= 3:
+            outlines.append(np.asarray(cleaned, dtype=np.int32).reshape(-1, 1, 2))
+
+    return outlines
 
 
 def segments_helper(segments, epsilon=2):
@@ -494,13 +525,8 @@ def classify_parallel_threshold(parallel_counts):
     return threshold
 
 
-def expand_door_swing_area(corners, gap_orientation, image_shape):
-    """Expand a door gap across the wall to include its possible swing arc.
-
-    The swing radius is estimated as the opening's long dimension. The original
-    door opening stays unchanged elsewhere; this expanded polygon is returned
-    specifically as the door area for later furniture exclusion/analysis.
-    """
+def expand_door_swing_area(corners, arc_geometry, image_shape, margin=4):
+    """Fit the door rectangle to the opening and measured arc pixel bounds."""
     points = np.asarray(corners, dtype=np.int32).reshape(-1, 2)
     height, width = image_shape[:2]
     left = int(points[:, 0].min())
@@ -508,37 +534,35 @@ def expand_door_swing_area(corners, gap_orientation, image_shape):
     top = int(points[:, 1].min())
     bottom = int(points[:, 1].max())
 
-    if gap_orientation == "horizontal":
-        swing_radius = right - left + 1
-        top = max(0, top - swing_radius)
-        bottom = min(height - 1, bottom + swing_radius)
-    elif gap_orientation == "vertical":
-        swing_radius = bottom - top + 1
-        left = max(0, left - swing_radius)
-        right = min(width - 1, right + swing_radius)
-    else:
-        return tuple(tuple(map(int, point)) for point in corners)
+    if arc_geometry is not None:
+        arc_left, arc_top, arc_right, arc_bottom = arc_geometry["bounds"]
+        side = arc_geometry["side"]
+        left = min(left, arc_left)
+        right = max(right, arc_right)
+        top = min(top, arc_top)
+        bottom = max(bottom, arc_bottom)
 
-    # Add a small safety margin around the whole door/swing rectangle.
-    # This also increases its width along the opening by two pixels per side.
-    padding = 2
-    left = max(0, left - padding)
-    right = min(width - 1, right + padding)
-    top = max(0, top - padding)
-    bottom = min(height - 1, bottom + padding)
+        if side == "left":
+            top = max(0, top - int(abs(left - right) / 5))
+            bottom = min(height, bottom + int(abs(left - right) / 5))
+            left = max(0, left - margin)
+        elif side == "right":
+            top = max(0, top - int(abs(left - right) / 5))
+            bottom = min(height, bottom + int(abs(left - right) / 5))
+            right = min(width - 1, right + margin)
+        elif side == "top":
+            left = max(0, left - int(abs(top - bottom) / 5))
+            right = min(width, right + int(abs(top - bottom) / 5))
+            top = max(0, top - margin)
+        elif side == "bottom":
+            left = max(0, left - int(abs(top - bottom) / 5))
+            right = min(width, right + int(abs(top - bottom) / 5))
+            bottom = min(height - 1, bottom + margin)
 
-    return (
-        (left, top),
-        (right, top),
-        (right, bottom),
-        (left, bottom),
-    )
+    return ((left, top), (right, top), (right, bottom), (left, bottom))
 
 
-def classify_opening_by_count_and_arc(parallel_count, threshold, binary_image, corners, gap_thickness, gap_orientation):
-    # Viertelkreis kontrolle:
-    door_arc = has_quarter_circle_arc(binary_image, corners, gap_thickness, gap_orientation)
-
+def classify_opening_by_count_and_arc(parallel_count, threshold, door_arc):
     # Werte ohne verwertbare Linie gehören immer zu something_else.
     if parallel_count < 2:
         return "unknown"
@@ -560,82 +584,154 @@ def classify_opening_by_count_and_arc(parallel_count, threshold, binary_image, c
     return "door" if door_arc else "window"
 
 
-def has_quarter_circle_arc(binary_image, corners, gap_thickness, gap_orientation):
-    """Return True when ink near an opening follows a door-swing quarter arc.
+def detect_door_arc_geometry(
+    binary_image,
+    corners,
+    gap_thickness,
+    gap_orientation,
+    ink_points=None,
+    angle_bin_count=18,
+    max_radius_ratio=1.2,
+):
+    """Detect a door arc and measure its radius and image-space bounds.
 
-    ``corners`` describes the rectangular wall gap. The test samples four
-    possible quarter-circle orientations at both ends of the gap. A distance
-    transform makes this tolerant of thin, slightly broken raster lines while
-    keeping the work proportional to the gap size (no contour/Hough search).
+    Candidate radii are derived from ink distances to possible hinges instead
+    of being estimated from the gap length. The best candidate must cover at
+    least 55% of the quarter-circle's angular bins.
     """
     if binary_image is None or binary_image.ndim != 2 or len(corners) < 4:
-        return False
+        return None
 
-    height, width = binary_image.shape
-    points = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
-    left = max(0, int(np.floor(points[:, 0].min())))
-    right = min(width - 1, int(np.ceil(points[:, 0].max())))
-    top = max(0, int(np.floor(points[:, 1].min())))
-    bottom = min(height - 1, int(np.ceil(points[:, 1].max())))
-    gap_w, gap_h = right - left + 1, bottom - top + 1
+    image_height, image_width = binary_image.shape
+    gap_points = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+    left = max(0, int(np.floor(gap_points[:, 0].min())))
+    right = min(image_width - 1, int(np.ceil(gap_points[:, 0].max())))
+    top = max(0, int(np.floor(gap_points[:, 1].min())))
+    bottom = min(image_height - 1, int(np.ceil(gap_points[:, 1].max())))
+    gap_width = right - left + 1
+    gap_height = bottom - top + 1
+
     if gap_orientation not in ("horizontal", "vertical"):
-        return False
-    horizontal = gap_orientation == "horizontal"
-    opening_width = gap_w if horizontal else gap_h
-    wall_thickness = max(1, int(gap_thickness))
-    if opening_width < max(6, 2 * wall_thickness):
-        return False
+        return None
+    opening_length = gap_width if gap_orientation == "horizontal" else gap_height
+    if opening_length < max(6, 2 * max(1, int(gap_thickness))):
+        return None
 
-    # Restrict distance-transform work to a padded neighborhood around this gap.
-    pad = int(np.ceil(opening_width * 1.15))
-    x0, x1 = max(0, left - pad), min(width, right + pad + 1)
-    y0, y1 = max(0, top - pad), min(height, bottom + pad + 1)
-    roi = (binary_image[y0:y1, x0:x1] > 0).astype(np.uint8)
-    if roi.size == 0 or not np.any(roi):
-        return False
-    # distanceTransform measures distance to zero; invert so ink is zero.
-    distance_to_ink = cv2.distanceTransform(1 - roi, cv2.DIST_L2, 3)
+    if ink_points is None:
+        ink_points = np.column_stack(np.nonzero(binary_image))[:, ::-1]
+    ink_points = np.asarray(ink_points, dtype=np.float32).reshape(-1, 2)
+    if len(ink_points) == 0:
+        return None
 
-    # Use several nearby radii because the detected gap can differ from the
-    # printed leaf/arc radius. Quarter arcs are sampled about once per pixel.
-    radii = np.unique(np.clip(
-        np.asarray([opening_width * 0.8, opening_width, opening_width * 1.2]),
-        3, pad,
-    ).astype(int))
-    tolerance = max(1.5, wall_thickness * 0.35)
-    angles = np.linspace(0, np.pi / 2, max(12, int(opening_width * np.pi / 4)))
-    best_coverage = 0.0
+    radius_tolerance = max(1, min(3, int(round(gap_thickness * 0.1))))
+    minimum_radius = max(4.0, gap_thickness * 0.5)
+    maximum_radius = max(opening_length * max_radius_ratio, gap_thickness * 2.0)
+    mid_x = (left + right) / 2.0
+    mid_y = (top + bottom) / 2.0
+    if gap_orientation == "horizontal":
+        hinges = [((left, mid_y), 1), ((right, mid_y), -1)]
+        arc_sides = (("top", -1), ("bottom", 1))
+    else:
+        hinges = [((mid_x, top), 1), ((mid_x, bottom), -1)]
+        arc_sides = (("left", -1), ("right", 1))
 
-    # Hinge centers lie at either end of the opening on the wall centerline.
-    centers = (
-        [(left, (top + bottom) / 2), (right, (top + bottom) / 2)]
-        if horizontal else
-        [((left + right) / 2, top), ((left + right) / 2, bottom)]
-    )
-    for cx, cy in centers:
-        for radius in radii:
-            for sx in (-1, 1):
-                for sy in (-1, 1):
-                    if horizontal:
-                        # The arc must extend away from the gap end, into the room.
-                        side_angles = angles if sx > 0 else np.pi - angles
-                        xs = cx + radius * np.cos(side_angles)
-                        ys = cy + sy * radius * np.sin(angles)
-                    else:
-                        side_angles = angles if sy > 0 else np.pi - angles
-                        ys = cy + radius * np.cos(side_angles)
-                        xs = cx + sx * radius * np.sin(angles)
+    best_geometry = None
+    best_score = (0, 0, 0, 0)
 
-                    ix = np.rint(xs - x0).astype(int)
-                    iy = np.rint(ys - y0).astype(int)
-                    valid = (ix >= 0) & (ix < distance_to_ink.shape[1]) & \
-                            (iy >= 0) & (iy < distance_to_ink.shape[0])
-                    if np.count_nonzero(valid) < len(angles) * 0.8:
-                        continue
-                    hits = distance_to_ink[iy[valid], ix[valid]] <= tolerance
-                    best_coverage = max(best_coverage, float(np.mean(hits)))
+    for (hinge_x, hinge_y), along_sign in hinges:
+        delta_x = ink_points[:, 0] - hinge_x
+        delta_y = ink_points[:, 1] - hinge_y
+        for side, side_sign in arc_sides:
+            if gap_orientation == "horizontal":
+                along = delta_x * along_sign
+                outward = delta_y * side_sign
+            else:
+                along = delta_y * along_sign
+                outward = delta_x * side_sign
 
-    return best_coverage >= 0.55
+            in_quadrant = (along >= 0) & (outward >= 0)
+            candidate_points = ink_points[in_quadrant]
+            along = along[in_quadrant]
+            outward = outward[in_quadrant]
+            distances = np.hypot(along, outward)
+            usable = (distances >= minimum_radius) & (distances <= maximum_radius)
+            candidate_points = candidate_points[usable]
+            along = along[usable]
+            outward = outward[usable]
+            distances = distances[usable]
+            if len(distances) < angle_bin_count:
+                continue
+
+            angle_bins = np.clip(
+                (np.arctan2(outward, along) / (np.pi / 2) * angle_bin_count)
+                .astype(np.int32),
+                0,
+                angle_bin_count - 1,
+            )
+            radius_bins = np.rint(distances).astype(np.int32)
+            accumulator = np.zeros(
+                (int(radius_bins.max()) + 1, angle_bin_count), dtype=np.uint8
+            )
+            np.maximum.at(accumulator, (radius_bins, angle_bins), 1)
+            radial_kernel = np.ones(
+                (2 * radius_tolerance + 1, 1), dtype=np.uint8
+            )
+            radial_support = cv2.dilate(accumulator, radial_kernel)
+            coverage_by_radius = np.count_nonzero(radial_support, axis=1)
+            radius_bin = int(np.argmax(coverage_by_radius))
+            coverage = int(coverage_by_radius[radius_bin])
+            if coverage < int(np.ceil(angle_bin_count * 0.55)):
+                continue
+
+            supported_angles = radial_support[radius_bin] > 0
+            run_edges = np.flatnonzero(
+                np.diff(np.concatenate(([False], supported_angles, [False])).astype(np.int8))
+            )
+            run_lengths = run_edges[1::2] - run_edges[::2]
+            if len(run_lengths) == 0:
+                continue
+            longest_run_index = int(np.argmax(run_lengths))
+            longest_angular_run = int(run_lengths[longest_run_index])
+            if longest_angular_run < int(np.ceil(angle_bin_count * 0.55)):
+                continue
+
+            arc_angle_mask = np.zeros(angle_bin_count, dtype=bool)
+            arc_angle_mask[
+                run_edges[2 * longest_run_index]:run_edges[2 * longest_run_index + 1]
+            ] = True
+            inliers = (
+                (np.abs(distances - radius_bin) <= radius_tolerance)
+                & arc_angle_mask[angle_bins]
+            )
+            arc_points = candidate_points[inliers]
+            if len(arc_points) < angle_bin_count:
+                continue
+
+            score = (longest_angular_run, coverage, len(arc_points), -radius_bin)
+            if score > best_score:
+                best_score = score
+                best_geometry = {
+                    "side": side,
+                    "hinge": (float(hinge_x), float(hinge_y)),
+                    "radius": float(np.median(distances[inliers])),
+                    "coverage": coverage / angle_bin_count,
+                    "arc_points": arc_points,
+                    "bounds": (
+                        int(np.floor(arc_points[:, 0].min())),
+                        int(np.floor(arc_points[:, 1].min())),
+                        int(np.ceil(arc_points[:, 0].max())),
+                        int(np.ceil(arc_points[:, 1].max())),
+                    ),
+                }
+
+    return best_geometry
+
+
+def has_quarter_circle_arc(binary_image, corners, gap_thickness, gap_orientation):
+    """Return whether a quarter-circle door arc can be fitted."""
+    return detect_door_arc_geometry(
+        binary_image, corners, gap_thickness, gap_orientation
+    ) is not None
 
 
 # Für die Wände
@@ -740,21 +836,31 @@ def find_parallel_groups(simplified_segments, wall_thickness):
 # Filtert die Wandrechtecke basierend auf Fläschenüberdeckung mit einem Bild
 def filter_wall_rectangles(rectangles, wall_image, min_support=0.5):
     accepted = []
+    image_height, image_width = wall_image.shape[:2]
 
     for horizontal, corners in rectangles:
-        rectangel_mask = np.zeros_like(wall_image)
         polygon = np.asarray(
             (corners[0], corners[1], corners[3], corners[2]),
             dtype=np.int32,
         )
-        cv2.fillConvexPoly(rectangel_mask, polygon, 255)
+        left = max(0, int(polygon[:, 0].min()))
+        right = min(image_width - 1, int(polygon[:, 0].max()))
+        top = max(0, int(polygon[:, 1].min()))
+        bottom = min(image_height - 1, int(polygon[:, 1].max()))
+        if left > right or top > bottom:
+            continue
 
-        inside = rectangel_mask > 0
+        local_polygon = polygon - np.array((left, top), dtype=np.int32)
+        local_mask = np.zeros((bottom - top + 1, right - left + 1), dtype=np.uint8)
+        cv2.fillConvexPoly(local_mask, local_polygon, 255)
+
+        inside = local_mask > 0
         area = np.count_nonzero(inside)
         if area == 0:
             continue
 
-        support = np.count_nonzero(wall_image[inside] > 0) / area
+        wall_roi = wall_image[top:bottom + 1, left:right + 1]
+        support = np.count_nonzero(wall_roi[inside] > 0) / area
 
         if support >= min_support:
             accepted.append((horizontal, corners))

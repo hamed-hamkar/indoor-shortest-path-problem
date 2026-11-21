@@ -1,367 +1,414 @@
+"""Interactive, clearance-aware path planning on a detected floor plan."""
+
+import heapq
+import itertools
+import math
+from pathlib import Path
+
 import cv2
 import numpy as np
 
-
-def analyze_structures(binary_image):
-    """Extract wall rectangles, find openings, then classify their evidence."""
-    wall_mask, wall_rectangles = extract_wall_candidates(binary_image)
-    openings = recognize_opening_in_wall(wall_rectangles)
-    windows, doors, unknown_openings = recognize_window_and_door(binary_image, openings)
-    furniture = recognize_furniture(binary_image, wall_mask, windows, doors, openings)
-
-    return {
-        "wall_mask": wall_mask,
-        "wall_rectangles": wall_rectangles,
-        "openings": openings,
-        "windows": windows,
-        "doors": doors,
-        "unknown_openings": unknown_openings,
-        "furniture": furniture,
-    }
+from preprocessing import preprocess_image
+from structure_rec import analyze_structures
 
 
-def extract_wall_candidates(binary_image):
-    if binary_image is None or binary_image.ndim != 2:
-        raise ValueError("binary_image muss ein zweidimensionales Binärbild sein")
-
-    height, width = binary_image.shape
-    distance = cv2.distanceTransform(binary_image, cv2.DIST_L2, 5)
-    foreground_distances = distance[binary_image > 0]
-    wall_mask = np.zeros_like(binary_image)
-    if foreground_distances.size == 0:
-        return wall_mask, []
-
-    distance_u8 = np.clip(distance, 0, 255).astype(np.uint8)
-    otsu_threshold, _ = cv2.threshold(
-        distance_u8[binary_image > 0].reshape(-1, 1), 0, 255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-    )
-    # Otsu may place the cutoff above the cores of thinner walls. Lower it
-    # proportionally so those cores remain available to Hough; keep the Otsu
-    # result as the image-specific reference instead of a fixed pixel value.
-    core_threshold = max(1.0, float(otsu_threshold) * 0.9)
-    core = np.where(distance >= core_threshold, 255, 0).astype(np.uint8)
-
-    # Scale line detection to the drawing size. The thickness still comes from
-    # the distance map below; this length only filters short strokes.
-    scale = min(height, width)
-    min_line_length = max(1, int(round(scale * 0.025)))
-    lines = cv2.HoughLinesP(
-        core, 1, np.pi / 180,
-        threshold=max(1, int(round(min_line_length * 0.35))),
-        minLineLength=min_line_length,
-        maxLineGap=max(1, int(round(scale * 0.01))),
-    )
-    if lines is None:
-        return wall_mask, []
-
-    raw_segments = []
-    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
-        dx, dy = int(x2 - x1), int(y2 - y1)
-        horizontal = abs(dx) >= abs(dy)
-        if horizontal:
-            coord, start, end = (y1 + y2) / 2, min(x1, x2), max(x1, x2)
-        else:
-            coord, start, end = (x1 + x2) / 2, min(y1, y2), max(y1, y2)
-        raw_segments.append((horizontal, coord, int(start), int(end)))
-
-    # Cluster duplicate detections by perpendicular position. Keep a group id
-    # so opening detection can compare only intervals on the same wall axis.
-    # Hough can return neighboring centerlines for one vertical wall near
-    # junctions. Cluster within roughly one core radius more than before;
-    # separate parallel walls remain apart by their measured wall thickness.
-    pos_tol = max(core_threshold * 2.0, scale * 0.002)
-    grouped = []
-    group_id = 0
-    for horizontal in (True, False):
-        ordered = sorted((s for s in raw_segments if s[0] == horizontal), key=lambda s: s[1])
-        bands = []
-        for segment in ordered:
-            if not bands or segment[1] - bands[-1][0] > pos_tol:
-                bands.append([segment[1], [segment]])
-            else:
-                bands[-1][1].append(segment)
-                bands[-1][0] = float(np.median([item[1] for item in bands[-1][1]]))
-
-        for coord, band in bands:
-            intervals = []
-            for start, end in sorted((s[2], s[3]) for s in band):
-                # Merge overlapping or directly adjacent detections only.
-                # A real gap must remain visible for opening recognition.
-                if intervals and start <= intervals[-1][1] + 1:
-                    intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
-                else:
-                    intervals.append((start, end))
-            grouped.extend((horizontal, group_id, int(round(coord)), a, b) for a, b in intervals)
-            group_id += 1
-
-    wall_rectangles = []
-    for horizontal, band_id, coord, start, end in grouped:
-        if horizontal:
-            coords = np.arange(start, end + 1, dtype=int)
-            xs = np.clip(coords, 0, width - 1)
-            ys = np.full(xs.shape, np.clip(coord, 0, height - 1), dtype=int)
-        else:
-            coords = np.arange(start, end + 1, dtype=int)
-            ys = np.clip(coords, 0, height - 1)
-            xs = np.full(ys.shape, np.clip(coord, 0, width - 1), dtype=int)
-
-        radii = distance[ys, xs]
-        radii = radii[radii > 0]
-        if radii.size == 0:
-            continue
-        half_thickness = max(1, int(round(float(np.median(radii)) + core_threshold)))
-        # Text fragments and small furniture strokes are commonly shorter
-        # than the local wall thickness; they are not useful wall rectangles.
-        if end - start + 1 < 2 * half_thickness:
-            continue
-
-        if horizontal:
-            corners = [
-                (int(start), int(coord - half_thickness)),
-                (int(end), int(coord - half_thickness)),
-                (int(end), int(coord + half_thickness)),
-                (int(start), int(coord + half_thickness)),
-            ]
-        else:
-            corners = [
-                (int(coord - half_thickness), int(start)),
-                (int(coord + half_thickness), int(start)),
-                (int(coord + half_thickness), int(end)),
-                (int(coord - half_thickness), int(end)),
-            ]
-
-        wall_rectangles.append({
-            "orientation": "horizontal" if horizontal else "vertical",
-            "group_id": band_id,
-            "start": int(start),
-            "end": int(end),
-            "centerline": int(coord),
-            "half_thickness": int(half_thickness),
-            "corners": corners,
-        })
-
-    # A wall band should connect to at least one perpendicular wall band.
-    # This rejects many text/furniture strokes that otherwise create fake gaps.
-    supported_group_ids = {
-        rectangle["group_id"]
-        for rectangle in wall_rectangles
-        if _has_perpendicular_support(rectangle, wall_rectangles)
-    }
-    wall_rectangles = [
-        rectangle for rectangle in wall_rectangles
-        if rectangle["group_id"] in supported_group_ids
-    ]
-    for rectangle in wall_rectangles:
-        cv2.fillConvexPoly(
-            wall_mask,
-            np.asarray(rectangle["corners"], dtype=np.int32),
-            255,
-        )
-
-    # Do not area-filter the mask here: an area-only filter can delete short
-    # real walls and would make the rectangle list disagree with the mask.
-    return wall_mask, wall_rectangles
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+IMAGE_PATH = PROJECT_DIR / "Bilder" / "Floor_Test_1.png"
+WINDOW_NAME = "Wegplanung - Start und Ziel anklicken"
 
 
-def _has_perpendicular_support(rectangle, all_rectangles):
-    for other in all_rectangles:
-        if other["orientation"] == rectangle["orientation"]:
-            continue
-        if rectangle["orientation"] == "horizontal":
-            horizontal, vertical = rectangle, other
-        else:
-            horizontal, vertical = other, rectangle
+def build_walkable_grid(
+    image_shape,
+    wall_rectangles,
+    window_rectangles,
+    furniture_outlines,
+    person_radius_px=7,
+    grid_step=3,
+):
+    """Build a conservative walkable grid, accounting for a person's width.
 
-        x = vertical["centerline"]
-        y = horizontal["centerline"]
-        horizontal_pad = vertical["half_thickness"]
-        vertical_pad = horizontal["half_thickness"]
-        if (
-            horizontal["start"] - horizontal_pad <= x <= horizontal["end"] + horizontal_pad
-            and vertical["start"] - vertical_pad <= y <= vertical["end"] + vertical_pad
-        ):
-            return True
-    return False
-
-
-def recognize_opening_in_wall(wall_rectangles):
-    """Find gaps between consecutive wall rectangles in the same aligned band."""
-    bands = {}
-    for rectangle in wall_rectangles:
-        bands.setdefault(rectangle["group_id"], []).append(rectangle)
-
-    openings = []
-    for rectangles in bands.values():
-        rectangles.sort(key=lambda item: item["start"])
-        for first, second in zip(rectangles, rectangles[1:]):
-            local_wall_thickness = first["half_thickness"] + second["half_thickness"]
-            if min(first["end"] - first["start"] + 1,
-                   second["end"] - second["start"] + 1) < local_wall_thickness:
-                continue
-            gap_start = first["end"] + 1
-            gap_end = second["start"] - 1
-            if gap_start > gap_end:
-                continue
-
-            half_thickness = int(round(local_wall_thickness / 2))
-            coord = int(round((first["centerline"] + second["centerline"]) / 2))
-            horizontal = first["orientation"] == "horizontal"
-            if horizontal:
-                corners = [
-                    (gap_start, coord - half_thickness),
-                    (gap_end, coord - half_thickness),
-                    (gap_end, coord + half_thickness),
-                    (gap_start, coord + half_thickness),
-                ]
-            else:
-                corners = [
-                    (coord - half_thickness, gap_start),
-                    (coord + half_thickness, gap_start),
-                    (coord + half_thickness, gap_end),
-                    (coord - half_thickness, gap_end),
-                ]
-
-            openings.append({
-                "orientation": first["orientation"],
-                "group_id": first["group_id"],
-                "start": int(gap_start),
-                "end": int(gap_end),
-                "centerline": coord,
-                "half_thickness": half_thickness,
-                "width": int(gap_end - gap_start + 1),
-                "corners": [(int(x), int(y)) for x, y in corners],
-            })
-    return openings
-
-
-def recognize_window_and_door(binary_image, openings):
-    """Classify only when the raster contains positive symbol evidence.
-
-    A continuous line near the middle of the wall band is window evidence.
-    A door needs a quarter-circle arc in the room area beside the gap. Anything
-    without either cue remains unknown instead of being guessed as a door.
+    Detected walls, windows, and furniture are obstacles. Door gaps are left
+    open because wall detection represents the wall segments on either side
+    of a gap; expanded door swing rectangles are deliberately not blocked.
     """
-    windows, doors, unknown = [], [], []
-    ink_distance = cv2.distanceTransform(cv2.bitwise_not(binary_image), cv2.DIST_L2, 5)
+    height, width = image_shape[:2]
+    obstacle_mask = np.zeros((height, width), dtype=np.uint8)
 
-    for opening in openings:
-        window_evidence = _has_window_center_line(binary_image, opening)
-        door_score = _door_swing_score(ink_distance, opening)
-        door_evidence = door_score >= 0.55
-        opening["window_line_evidence"] = window_evidence
-        opening["door_arc_score"] = door_score
+    for wall in wall_rectangles:
+        corners = wall["corners"] if isinstance(wall, dict) else wall
+        polygon = np.asarray(corners, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.fillConvexPoly(obstacle_mask, polygon, 255)
 
-        # A long stroke can be a window divider or a door threshold/leaf, and
-        # nearby drawing details can imitate a short arc. Conflicting evidence
-        # is kept for review instead of forcing a label.
-        if window_evidence and door_evidence:
-            opening["classification"] = "ambiguous"
-            unknown.append(opening)
-        elif door_evidence:
-            opening["classification"] = "door"
-            doors.append(_gap_endpoints(opening))
-        elif window_evidence:
-            opening["classification"] = "window"
-            windows.append(_gap_endpoints(opening))
-        else:
-            opening["classification"] = "unknown"
-            unknown.append(opening)
-    return windows, doors, unknown
+    for corners in window_rectangles:
+        polygon = np.asarray(corners, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.fillConvexPoly(obstacle_mask, polygon, 255)
 
+    for outline in furniture_outlines:
+        polygon = np.asarray(outline, dtype=np.int32).reshape(-1, 1, 2)
+        if len(polygon) >= 3:
+            cv2.fillPoly(obstacle_mask, [polygon], 255)
 
-def _has_window_center_line(binary_image, opening):
-    x_values = [point[0] for point in opening["corners"]]
-    y_values = [point[1] for point in opening["corners"]]
-    x0, x1 = max(0, min(x_values)), min(binary_image.shape[1], max(x_values) + 1)
-    y0, y1 = max(0, min(y_values)), min(binary_image.shape[0], max(y_values) + 1)
-    patch = binary_image[y0:y1, x0:x1]
-    if patch.size == 0 or opening["width"] <= 0:
-        return False
+    # Inflate obstacles so the path represents the person's center, not their
+    # outer boundary. The extra radius is configurable in source-image pixels.
+    if person_radius_px > 0:
+        diameter = 2 * int(person_radius_px) + 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (diameter, diameter)
+        )
+        obstacle_mask = cv2.dilate(obstacle_mask, kernel)
 
-    # For a horizontal wall, a window stroke runs along x; for a vertical wall
-    # it runs along y. Require support across most of the opening length.
-    if opening["orientation"] == "horizontal":
-        support = np.count_nonzero(patch, axis=1)
-        middle = (patch.shape[0] - 1) / 2
-    else:
-        support = np.count_nonzero(patch, axis=0)
-        middle = (patch.shape[1] - 1) / 2
-    required_support = 0.6 * opening["width"]
-    center_tolerance = max(1, opening["half_thickness"] * 0.5)
-    return any(
-        count >= required_support and abs(index - middle) <= center_tolerance
-        for index, count in enumerate(support)
+    # Pad to whole cells. Padding is blocked so routes cannot escape the image.
+    grid_step = max(1, int(grid_step))
+    grid_height = math.ceil(height / grid_step)
+    grid_width = math.ceil(width / grid_step)
+    padded = cv2.copyMakeBorder(
+        obstacle_mask,
+        0,
+        grid_height * grid_step - height,
+        0,
+        grid_width * grid_step - width,
+        cv2.BORDER_CONSTANT,
+        value=255,
     )
+    blocked_cells = padded.reshape(
+        grid_height, grid_step, grid_width, grid_step
+    ).max(axis=(1, 3))
+    walkable = (blocked_cells == 0).astype(np.uint8)
+
+    # Distance from each walkable cell to the nearest obstacle, in source
+    # pixels. Theta* uses this to prefer paths with more comfortable clearance.
+    clearance = cv2.distanceTransform(walkable, cv2.DIST_L2, 5) * grid_step
+    return walkable, clearance
 
 
-def _door_swing_score(ink_distance, opening):
-    nominal_radius = float(opening["width"])
-    if nominal_radius < 3:
+def _line_cells(start, end):
+    """Sample a grid line densely enough for collision and clearance checks."""
+    row0, col0 = start
+    row1, col1 = end
+    steps = max(abs(row1 - row0), abs(col1 - col0)) * 2
+    if steps == 0:
+        return [start]
+
+    cells = []
+    for index in range(steps + 1):
+        fraction = index / steps
+        cell = (
+            int(round(row0 + (row1 - row0) * fraction)),
+            int(round(col0 + (col1 - col0) * fraction)),
+        )
+        if not cells or cell != cells[-1]:
+            cells.append(cell)
+    return cells
+
+
+def _line_of_sight(walkable, start, end):
+    """Return whether a segment stays in free cells without corner cutting."""
+    previous = None
+    height, width = walkable.shape
+    for row, col in _line_cells(start, end):
+        if not (0 <= row < height and 0 <= col < width):
+            return False
+        if walkable[row, col] == 0:
+            return False
+        if previous is not None:
+            prev_row, prev_col = previous
+            row_step = row - prev_row
+            col_step = col - prev_col
+            if row_step and col_step:
+                if (
+                    walkable[prev_row + row_step, prev_col] == 0
+                    or walkable[prev_row, prev_col + col_step] == 0
+                ):
+                    return False
+        previous = (row, col)
+    return True
+
+
+def _segment_cost(start, end, clearance, preferred_clearance_px, comfort_weight):
+    """Measure distance plus a soft penalty for walking close to obstacles."""
+    cells = _line_cells(start, end)
+    distance = math.hypot(end[0] - start[0], end[1] - start[1])
+    if distance == 0:
         return 0.0
 
-    half = float(opening["half_thickness"])
-    # Wall thickness is not the symbol stroke width. A wide tolerance made
-    # nearby letters and furniture look like door arcs.
-    tolerance = max(1.5, min(2.5, half * 0.25))
-    horizontal = opening["orientation"] == "horizontal"
-    best_score = 0.0
+    if preferred_clearance_px <= 0 or comfort_weight <= 0:
+        return distance
 
-    # Printed door arcs are not always exactly the same radius as the wall gap,
-    # and the detected jamb can be shifted by a few pixels. Search relative to
-    # the measured opening and wall thickness rather than fixed pixel offsets.
-    for radius in np.linspace(nominal_radius * 0.8, nominal_radius * 1.2, 9):
-        sample_count = max(8, int(round(radius)))
-        angles = np.linspace(0, np.pi / 2, sample_count)
-        for hinge in (opening["start"], opening["end"]):
-            along_sign = 1 if hinge == opening["start"] else -1
-            for hinge_shift in (-half, 0, half):
-                for room_sign in (-1, 1):
-                    if horizontal:
-                        xs = hinge + hinge_shift + along_sign * radius * np.sin(angles)
-                        ys = opening["centerline"] + room_sign * radius * np.cos(angles)
-                    else:
-                        xs = opening["centerline"] + room_sign * radius * np.cos(angles)
-                        ys = hinge + hinge_shift + along_sign * radius * np.sin(angles)
-
-                    xi = np.rint(xs).astype(int)
-                    yi = np.rint(ys).astype(int)
-                    valid = (
-                        (xi >= 0) & (xi < ink_distance.shape[1]) &
-                        (yi >= 0) & (yi < ink_distance.shape[0])
-                    )
-                    if not np.any(valid):
-                        continue
-                    score = float(np.mean(ink_distance[yi[valid], xi[valid]] <= tolerance))
-                    best_score = max(best_score, score)
-
-    return best_score
-
-
-def _gap_endpoints(opening):
-    if opening["orientation"] == "horizontal":
-        y = opening["centerline"]
-        return (opening["start"], y), (opening["end"], y)
-    x = opening["centerline"]
-    return (x, opening["start"]), (x, opening["end"])
-
-
-def recognize_furniture(binary_image, wall_image, windows_pos, doors_pos, openings=None):
-    exclusion_mask = np.zeros_like(binary_image)
-    exclusion_mask[wall_image > 0] = 255
-    for gap in windows_pos + doors_pos:
-        (x1, y1), (x2, y2) = gap
-        cv2.rectangle(
-            exclusion_mask,
-            (min(x1, x2), min(y1, y2)),
-            (max(x1, x2), max(y1, y2)),
-            255,
-            -1,
+    risks = [
+        max(
+            0.0,
+            min(1.0, (preferred_clearance_px - clearance[row, col])
+                / preferred_clearance_px),
         )
-    for opening in openings or []:
-        cv2.fillConvexPoly(
-            exclusion_mask,
-            np.asarray(opening["corners"], dtype=np.int32),
-            255,
+        for row, col in cells
+    ]
+    mean_risk = sum(risks) / len(risks)
+    return distance * (1.0 + comfort_weight * mean_risk)
+
+
+def theta_star(
+    walkable,
+    start,
+    goal,
+    clearance=None,
+    preferred_clearance_px=24,
+    comfort_weight=1.5,
+):
+    """Find an any-angle path with Theta*, biased toward wider open space.
+
+    ``start`` and ``goal`` are ``(row, column)`` grid coordinates. Returns a
+    list of grid coordinates, or ``None`` when no path exists.
+    """
+    walkable = np.asarray(walkable, dtype=np.uint8)
+    if walkable.ndim != 2:
+        raise ValueError("walkable muss eine zweidimensionale Maske sein")
+
+    start = tuple(map(int, start))
+    goal = tuple(map(int, goal))
+    height, width = walkable.shape
+    for point in (start, goal):
+        row, col = point
+        if not (0 <= row < height and 0 <= col < width):
+            return None
+        if walkable[row, col] == 0:
+            return None
+
+    if clearance is None:
+        clearance = cv2.distanceTransform(walkable, cv2.DIST_L2, 5)
+
+    def heuristic(point):
+        return math.hypot(goal[0] - point[0], goal[1] - point[1])
+
+    sequence = itertools.count()
+    open_set = [(heuristic(start), 0.0, next(sequence), start)]
+    g_score = {start: 0.0}
+    parent = {start: start}
+    neighbors = (
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),             (0, 1),
+        (1, -1),  (1, 0),   (1, 1),
+    )
+
+    while open_set:
+        _, queued_cost, _, current = heapq.heappop(open_set)
+        if queued_cost > g_score.get(current, math.inf):
+            continue
+        if current == goal:
+            path = [goal]
+            while path[-1] != start:
+                path.append(parent[path[-1]])
+            return path[::-1]
+
+        current_row, current_col = current
+        for row_offset, col_offset in neighbors:
+            neighbor = (current_row + row_offset, current_col + col_offset)
+            row, col = neighbor
+            if not (0 <= row < height and 0 <= col < width):
+                continue
+            if walkable[row, col] == 0:
+                continue
+
+            # Theta*: try connecting the neighbor directly to the current
+            # node's parent; this removes grid-heading constraints where clear.
+            ancestor = parent[current]
+            if _line_of_sight(walkable, ancestor, neighbor):
+                candidate_parent = ancestor
+                candidate_cost = g_score[ancestor] + _segment_cost(
+                    ancestor,
+                    neighbor,
+                    clearance,
+                    preferred_clearance_px,
+                    comfort_weight,
+                )
+            else:
+                if not _line_of_sight(walkable, current, neighbor):
+                    continue
+                candidate_parent = current
+                candidate_cost = g_score[current] + _segment_cost(
+                    current,
+                    neighbor,
+                    clearance,
+                    preferred_clearance_px,
+                    comfort_weight,
+                )
+
+            if candidate_cost >= g_score.get(neighbor, math.inf):
+                continue
+            g_score[neighbor] = candidate_cost
+            parent[neighbor] = candidate_parent
+            heapq.heappush(
+                open_set,
+                (
+                    candidate_cost + heuristic(neighbor),
+                    candidate_cost,
+                    next(sequence),
+                    neighbor,
+                ),
+            )
+
+    return None
+
+
+def grid_path_to_pixels(path, grid_step, image_shape):
+    """Convert grid-cell centers to ``(x, y)`` image coordinates."""
+    if not path:
+        return np.empty((0, 2), dtype=np.int32)
+    height, width = image_shape[:2]
+    points = [
+        (
+            min(width - 1, col * grid_step + grid_step // 2),
+            min(height - 1, row * grid_step + grid_step // 2),
         )
-    return cv2.bitwise_and(binary_image, binary_image, mask=cv2.bitwise_not(exclusion_mask))
+        for row, col in path
+    ]
+    return np.asarray(points, dtype=np.int32)
+
+
+def _point_to_grid(point, grid_step):
+    x, y = point
+    return int(y // grid_step), int(x // grid_step)
+
+
+def main():
+    if not IMAGE_PATH.exists():
+        raise FileNotFoundError(f"Grundrissbild nicht gefunden: {IMAGE_PATH}")
+
+    images = preprocess_image(str(IMAGE_PATH))
+    walls, windows, doors, furniture = analyze_structures(
+        images["binary"], images["original"]
+    )
+    # Six source pixels per search cell keeps the Python implementation
+    # responsive while retaining enough detail for room-scale paths.
+    grid_step = 6
+    walkable, clearance = build_walkable_grid(
+        images["original"].shape,
+        walls,
+        windows,
+        furniture,
+        person_radius_px=7,
+        grid_step=grid_step,
+    )
+
+    selected_points = []
+    base_image = images["original"].copy()
+    display_image = base_image.copy()
+    status = "Linksklick: Startpunkt, danach Zielpunkt | R: neu | Q: Ende"
+
+    def redraw():
+        nonlocal display_image
+        display_image = base_image.copy()
+        if len(selected_points) == 2:
+            start_grid = _point_to_grid(selected_points[0], grid_step)
+            goal_grid = _point_to_grid(selected_points[1], grid_step)
+            path = theta_star(
+                walkable,
+                start_grid,
+                goal_grid,
+                clearance=clearance,
+                preferred_clearance_px=24,
+                comfort_weight=1.5,
+            )
+            if path:
+                path_pixels = grid_path_to_pixels(
+                    path, grid_step, base_image.shape
+                ).reshape(-1, 1, 2)
+                cv2.polylines(
+                    display_image,
+                    [path_pixels],
+                    False,
+                    (0, 220, 255),
+                    5,
+                    cv2.LINE_AA,
+                )
+            else:
+                cv2.putText(
+                    display_image,
+                    "Kein begehbarer Weg zwischen den Punkten",
+                    (20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+        if selected_points:
+            cv2.circle(display_image, selected_points[0], 7, (0, 200, 0), -1)
+            cv2.putText(
+                display_image, "Start", (selected_points[0][0] + 9, selected_points[0][1]),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 150, 0), 2, cv2.LINE_AA,
+            )
+        if len(selected_points) > 1:
+            cv2.circle(display_image, selected_points[1], 7, (0, 0, 255), -1)
+            cv2.putText(
+                display_image, "Ziel", (selected_points[1][0] + 9, selected_points[1][1]),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 220), 2, cv2.LINE_AA,
+            )
+
+        cv2.putText(
+            display_image,
+            status,
+            (12, display_image.shape[0] - 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            display_image,
+            status,
+            (12, display_image.shape[0] - 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    def handle_mouse(event, x, y, flags, callback_data):
+        nonlocal status
+        if event == cv2.EVENT_LBUTTONDOWN:
+            grid_point = _point_to_grid((x, y), grid_step)
+            row, col = grid_point
+            if not (0 <= row < walkable.shape[0] and 0 <= col < walkable.shape[1]):
+                status = "Punkt liegt außerhalb des begehbaren Bildbereichs."
+                redraw()
+                return
+            if walkable[row, col] == 0:
+                status = "Punkt liegt in einem Hindernis; bitte freien Boden wählen."
+                redraw()
+                return
+
+            if len(selected_points) == 2:
+                selected_points.clear()
+            selected_points.append((x, y))
+            status = (
+                "Zielpunkt anklicken"
+                if len(selected_points) == 1
+                else "Weg berechnet | R: neu | Q: Ende"
+            )
+            redraw()
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            selected_points.clear()
+            status = "Linksklick: Startpunkt, danach Zielpunkt | R: neu | Q: Ende"
+            redraw()
+
+    redraw()
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(WINDOW_NAME, handle_mouse)
+    while True:
+        cv2.imshow(WINDOW_NAME, display_image)
+        key = cv2.waitKey(20) & 0xFF
+        if key in (ord("q"), ord("Q"), 27):
+            break
+        if key in (ord("r"), ord("R")):
+            selected_points.clear()
+            status = "Linksklick: Startpunkt, danach Zielpunkt | R: neu | Q: Ende"
+            redraw()
+
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

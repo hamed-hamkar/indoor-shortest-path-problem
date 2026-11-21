@@ -525,7 +525,7 @@ def classify_parallel_threshold(parallel_counts):
     return threshold
 
 
-def expand_door_swing_area(corners, arc_geometry, image_shape, margin=4):
+def expand_door_swing_area(corners, arc_geometry, image_shape):
     """Fit the door rectangle to the opening and measured arc pixel bounds."""
     points = np.asarray(corners, dtype=np.int32).reshape(-1, 2)
     height, width = image_shape[:2]
@@ -543,21 +543,21 @@ def expand_door_swing_area(corners, arc_geometry, image_shape, margin=4):
         bottom = max(bottom, arc_bottom)
 
         if side == "left":
-            top = max(0, top - int(abs(left - right) / 5))
-            bottom = min(height, bottom + int(abs(left - right) / 5))
-            left = max(0, left - margin)
+            top = max(0, top - int(abs(left - right) / 6))
+            bottom = min(height, bottom + int(abs(left - right) / 6))
+            left = max(0, left - int(abs(left - right) / 6))
         elif side == "right":
-            top = max(0, top - int(abs(left - right) / 5))
-            bottom = min(height, bottom + int(abs(left - right) / 5))
-            right = min(width - 1, right + margin)
+            top = max(0, top - int(abs(left - right) / 6))
+            bottom = min(height, bottom + int(abs(left - right) / 6))
+            right = min(width - 1, right + int(abs(left - right) / 6))
         elif side == "top":
-            left = max(0, left - int(abs(top - bottom) / 5))
-            right = min(width, right + int(abs(top - bottom) / 5))
-            top = max(0, top - margin)
+            left = max(0, left - int(abs(top - bottom) / 6))
+            right = min(width, right + int(abs(top - bottom) / 6))
+            top = max(0, top - int(abs(top - bottom) / 6))
         elif side == "bottom":
-            left = max(0, left - int(abs(top - bottom) / 5))
-            right = min(width, right + int(abs(top - bottom) / 5))
-            bottom = min(height - 1, bottom + margin)
+            left = max(0, left - int(abs(top - bottom) / 6))
+            right = min(width, right + int(abs(top - bottom) / 6))
+            bottom = min(height - 1, bottom + int(abs(top - bottom) / 6))
 
     return ((left, top), (right, top), (right, bottom), (left, bottom))
 

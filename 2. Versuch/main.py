@@ -76,4 +76,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Start the interactive path planner when this file is run from VS Code.
+    # The structure-only view remains available by calling main() directly.
+    from open_space_analysis import main as run_path_planner
+
+    run_path_planner()

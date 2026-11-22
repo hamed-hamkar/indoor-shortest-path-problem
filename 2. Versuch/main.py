@@ -10,6 +10,7 @@ project_dir = Path(__file__).resolve().parent.parent
 image_path = project_dir / "Bilder" / "Floor_Test_1.png"
 
 
+
 def draw_labeled_polygon(image, corners, color, label):
     """Draw a polygon and its category label onto the result image."""
     polygon = np.asarray(corners, dtype=np.int32).reshape(-1, 1, 2)

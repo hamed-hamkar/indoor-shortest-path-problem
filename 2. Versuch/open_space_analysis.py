@@ -81,6 +81,7 @@ def build_walkable_grid(
     return walkable, clearance
 
 
+
 def _line_cells(start, end):
     """Sample a grid line densely enough for collision and clearance checks."""
     row0, col0 = start

@@ -9,6 +9,7 @@ def analyze_structures(binary_image, original_image=None):
         binary_image,
         original_image,
     )
+    
     window_rectangles, door_rectangles = window_or_door(gap_line, binary_image)
     furniture_rectangles = check_for_furniture(
         binary_image,

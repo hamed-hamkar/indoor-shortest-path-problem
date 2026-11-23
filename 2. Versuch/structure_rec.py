@@ -1,13 +1,14 @@
 import cv2
 import numpy as np
 
-def analyze_structures(binary_image, original_image=None):
-    wall_rectangles = extract_wall_candidates(binary_image)
+def analyze_structures(binary_image, original_image=None, debug_images=None):
+    wall_rectangles = extract_wall_candidates(binary_image, debug_images)
     wall_gaps_pos = recognize_opening_in_wall(wall_rectangles)
     gap_line = wall_gap_interpreter(
         wall_gaps_pos,
         binary_image,
         original_image,
+        debug_images,
     )
     
     window_rectangles, door_rectangles = window_or_door(gap_line, binary_image)
@@ -16,6 +17,7 @@ def analyze_structures(binary_image, original_image=None):
         wall_rectangles,
         door_rectangles,
         window_rectangles,
+        debug_images,
     )
 
 
@@ -27,7 +29,7 @@ def analyze_structures(binary_image, original_image=None):
     )
 
 
-def extract_wall_candidates(binary_image):
+def extract_wall_candidates(binary_image, debug_images=None):
     if binary_image is None or binary_image.ndim != 2:
         raise ValueError(
             "binary_image in extract_wall_candidates ist kein zweidimensionales Binärbild"
@@ -38,7 +40,19 @@ def extract_wall_candidates(binary_image):
 
     # Wenn forgorund_distance keine Werte hat, gibt es keine Wände
     if foreground_distances.size == 0:
+        if debug_images is not None:
+            debug_images["Wand: Distanzmaske"] = np.zeros_like(binary_image)
+            debug_images["Wand: Otsu-Maske"] = np.zeros_like(binary_image)
+            debug_images["Wand: Kernmaske"] = np.zeros_like(binary_image)
+            debug_images["Wand: erkannte Segmente"] = np.zeros_like(binary_image)
+            debug_images["Wand: Rechteckmaske"] = np.zeros_like(binary_image)
         return []
+
+    if debug_images is not None:
+        distance_view = cv2.normalize(
+            distance, None, 0, 255, cv2.NORM_MINMAX
+        ).astype(np.uint8)
+        debug_images["Wand: Distanzmaske"] = distance_view
 
     otsu_image = np.zeros_like(binary_image)
 
@@ -62,11 +76,15 @@ def extract_wall_candidates(binary_image):
         cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
     otsu_image[binary_image > 0] = otsu_values.ravel()
+    if debug_images is not None:
+        debug_images["Wand: Otsu-Maske"] = otsu_image.copy()
 
     # Otsu kann dünnere Wände abschneiden, damit das nicht passiert, verkleinern wir den otsu_threshold
     # und sorgen dafür, dass es nicht kleiner als 1 Pixel werden kann
     core_threshold = max(1.0, float(otsu_threshold) * 0.9)
     core = np.where(distance >= core_threshold, 255, 0).astype(np.uint8)
+    if debug_images is not None:
+        debug_images["Wand: Kernmaske"] = core.copy()
     core_distance = distance[core > 0]
 
     # HoughLinesP funktioniert nicht gut mit der erkennnung von den kleinen Wänden,
@@ -80,6 +98,13 @@ def extract_wall_candidates(binary_image):
         segments = outlines.getSegments() or []
 
     simplified_segments = segments_helper(segments)
+    if debug_images is not None:
+        segment_view = np.zeros_like(binary_image)
+        for segment in simplified_segments:
+            points = np.asarray(segment, dtype=np.int32).reshape(-1, 1, 2)
+            if len(points) >= 2:
+                cv2.polylines(segment_view, [points], False, 255, 1)
+        debug_images["Wand: erkannte Segmente"] = segment_view
 
     # Rechteckbildung:
     # [(50, 40), (50, 100)],            # gerader Abschnitt
@@ -126,6 +151,15 @@ def extract_wall_candidates(binary_image):
     rectangles = expand_rectangles_and_add_gap_checkers(
         rectangles, margin=3, image_shape=binary_image.shape
     )
+
+    if debug_images is not None:
+        wall_mask = np.zeros_like(binary_image)
+        for rectangle in rectangles:
+            polygon = np.asarray(
+                rectangle["corners"], dtype=np.int32
+            ).reshape(-1, 1, 2)
+            cv2.fillConvexPoly(wall_mask, polygon, 255)
+        debug_images["Wand: Rechteckmaske"] = wall_mask
 
     return rectangles
 
@@ -179,7 +213,9 @@ def recognize_opening_in_wall(wall_rectangles, threshold=0):
     return openings
 
 
-def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
+def wall_gap_interpreter(
+    wall_openings, binary_image, original_image=None, debug_images=None
+):
     opening_regions = []
     if original_image is None:
         original_gray = None
@@ -199,8 +235,15 @@ def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
         })
 
     results = []
+    openings_mask = np.zeros_like(binary_image)
+    gap_edges_image = np.zeros_like(binary_image)
 
     for region in opening_regions:
+        cv2.fillConvexPoly(
+            openings_mask,
+            np.asarray(region["corners"], dtype=np.int32),
+            255,
+        )
         left, top, right, bottom = region["bounds"]
         # Wall openings are axis-aligned rectangles, so crop the binary image
         # directly instead of masking and copying the entire image first.
@@ -228,6 +271,9 @@ def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
                 ]
 
             gap_edges = cv2.Canny(gap_source, 50, 150)
+            gap_edges_image[top:bottom + 1, left:right + 1] = cv2.bitwise_or(
+                gap_edges_image[top:bottom + 1, left:right + 1], gap_edges
+            )
             hough_lines = cv2.HoughLinesP(
                 gap_edges,
                 rho=1,
@@ -263,6 +309,10 @@ def wall_gap_interpreter(wall_openings, binary_image, original_image=None):
             "parallel_groups": parallel_groups,
             "gap_segments": gap_segments,
         })
+
+    if debug_images is not None:
+        debug_images["Öffnungen: Gap-Maske"] = openings_mask
+        debug_images["Öffnungen: Canny-Kanten"] = gap_edges_image
 
     return results
 
@@ -322,6 +372,7 @@ def check_for_furniture(
     wall_rectangles,
     door_rectangles,
     window_rectangles,
+    debug_images=None,
 ):
     """Return foreground drawing pixels outside walls and known openings."""
     everything_except_furniture_mask = np.zeros_like(binary_image)
@@ -336,11 +387,18 @@ def check_for_furniture(
         polygon = np.asarray(rectangle, dtype=np.int32).reshape(-1, 1, 2)
         cv2.fillConvexPoly(everything_except_furniture_mask, polygon, 255)
 
+    if debug_images is not None:
+        debug_images["Möbel: Ausschlussmaske Wände, Türen, Fenster"] = (
+            everything_except_furniture_mask.copy()
+        )
+
     furniture_image = cv2.bitwise_and(
         binary_image,
         binary_image,
         mask=cv2.bitwise_not(everything_except_furniture_mask),
     )
+    if debug_images is not None:
+        debug_images["Möbel: Kandidatenmaske"] = furniture_image.copy()
 
     # Keep nested contours temporarily so the positional filter below can
     # remove furniture candidates enclosed by another candidate.
@@ -350,7 +408,13 @@ def check_for_furniture(
     furniture_contours = remove_small_contours(furniture_contours)
     furniture_contours = remove_contours_inside_other_contours(furniture_contours)
 
-    return orthogonal_contours(furniture_contours, binary_image.shape)
+    outlines = orthogonal_contours(furniture_contours, binary_image.shape)
+    if debug_images is not None:
+        outline_mask = np.zeros_like(binary_image)
+        if outlines:
+            cv2.drawContours(outline_mask, outlines, -1, 255, thickness=2)
+        debug_images["Möbel: orthogonale Umrisse"] = outline_mask
+    return outlines
 
 
 def remove_small_contours(contours, min_area=50.0):

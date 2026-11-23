@@ -22,5 +22,6 @@ def preprocess_image(image_path):
     )
     return {
         "original": img,
+        "gray": gray,
         "binary": binary,
     }

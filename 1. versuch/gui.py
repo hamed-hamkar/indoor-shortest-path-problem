@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PyQt6 import uic
 from PyQt6.QtWidgets import QMainWindow, QVBoxLayout
 
@@ -9,16 +11,22 @@ from map_widget import InteractiveMapLabel
 from algorithms import astar
 
 
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         # GUI aus Qt Designer laden
-        uic.loadUi("main_window.ui", self)
+        ui_path = PROJECT_DIR / "main_window.ui"
+        uic.loadUi(str(ui_path), self)
 
         # --- Daten vorbereiten ---
         self.tile_size = 20
-        self.image_path = "Bilder/Multi-Room-Floor-Plan-Template-edit-online-1123609580.png"
+        self.image_path = (
+            PROJECT_DIR.parent / "Bilder" / "Floor_Test_1.png"
+        )
 
         self.image, self.gray_image = load_image(self.image_path)
         self.wall_mask = detect_walls(self.gray_image)
